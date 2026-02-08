@@ -17,7 +17,7 @@ Key improvements:
   identify paid sick days that follow the karens day
 """
 
-APP_VERSION = "2025-02-08 15:45 CET"
+APP_VERSION = "2026-02-08 17:25 CET"
 
 import re
 import os
@@ -358,8 +358,61 @@ class SickListParser:
         r"^\s*(\d{1,2})\s{8,}(\d{2}:\d{2})\s*-\s*(\d{2}:\d{2})\s+(\d+,\d+)\s+(.*)$"
     )
 
+    # Regex to extract start-end times from table cells like "22:30" "- 00:00"
+    _TIME_RE = re.compile(r"(\d{2}:\d{2})")
+
     def __init__(self, config: Config):
         self.config = config
+
+    def _extract_jour_set(self, page) -> set:
+        """
+        Use table extraction on a sick list page to detect jour rows.
+
+        The PDF table has separate columns for regular hours (col 3) and
+        jour hours (col 6) on the left (Sjukskriven) side.  When hours
+        appear in col 6 instead of col 3 the row is jour.
+
+        Returns a set of (day: int, start: str, end: str) tuples that
+        are jour rows, used to override the text-based detection which
+        cannot distinguish jour from regular on summary pages.
+        """
+        jour_keys: set = set()
+        try:
+            tables = page.extract_tables(
+                {"vertical_strategy": "text", "horizontal_strategy": "text"}
+            )
+            if not tables:
+                return jour_keys
+
+            for row in tables[0]:
+                if len(row) < 10:
+                    continue
+                left = row[:10]
+
+                # Jour row: col 3 empty, col 6 has hours
+                has_regular = bool(left[3] and left[3].strip())
+                has_jour = bool(left[6] and left[6].strip())
+                if not has_jour or has_regular:
+                    continue
+
+                # Extract day number from col 0
+                day_m = re.match(r"\s*(\d{1,2})", left[0] or "")
+                if not day_m:
+                    continue
+                day = int(day_m.group(1))
+
+                # Extract start and end times from cols 4-5
+                times = []
+                for cell in (left[4], left[5]):
+                    for tm in self._TIME_RE.finditer(cell or ""):
+                        times.append(tm.group(1))
+                if len(times) >= 2:
+                    jour_keys.add((day, times[0], times[1]))
+
+        except Exception as e:
+            logger.debug(f"Table extraction for jour detection failed: {e}")
+
+        return jour_keys
 
     def detect_sicklist_pages(self, pdf_path: str) -> List[int]:
         """Dynamically detect which pages contain sick list data"""
@@ -449,7 +502,8 @@ class SickListParser:
                         logger.warning(f"Page {pidx} out of range")
                         continue
 
-                    text = pdf.pages[pidx].extract_text() or ""
+                    page_obj = pdf.pages[pidx]
+                    text = page_obj.extract_text() or ""
 
                     # Extract month and year from header
                     mh = re.search(self.config.sick_list_header_pattern, text)
@@ -458,6 +512,12 @@ class SickListParser:
                     month = SwedishDateHelper.parse_month_name(month_name)
 
                     logger.info(f"Parsing page {pidx+1}: {month_name.capitalize()} {year}")
+
+                    # Build jour lookup from table extraction (left side
+                    # of PDF has separate columns for regular vs jour hours)
+                    jour_set = self._extract_jour_set(page_obj)
+                    if jour_set:
+                        logger.info(f"  Detected {len(jour_set)} jour rows via table extraction")
 
                     # Parse each sick row
                     for line in text.splitlines():
@@ -468,6 +528,11 @@ class SickListParser:
                             if stripped and stripped[0].isdigit() and re.match(r"^\s*\d{1,2}\s", line):
                                 logger.debug(f"  UNPARSED LINE: {line!r}")
                             continue
+
+                        # Override jour flag from table extraction
+                        key = (parsed["day"], parsed["start"], parsed["end"])
+                        if key in jour_set:
+                            parsed["is_jour"] = True
 
                         try:
                             dt = date(year, month, parsed["day"])
@@ -1091,8 +1156,17 @@ class ReportGenerator:
             })
 
         # "Sjuklön (timlön)" — use base hours (not sum of OB rows which includes supplements)
+        # Jour vacancy hours are OB supplements with a separate rate and are
+        # already accounted for on their own rows ("Sjuk jourers helg/vardag").
+        # They must NOT be deducted again from the timlön summary.
+        JOUR_OB_CLASSES = {"Sjuk jourers helg", "Sjuk jourers vardag"}
+        jour_just = sum(
+            just_by_ob.get(ob, 0.0) for ob in JOUR_OB_CLASSES
+        )
+        non_jour_just = round(actual_total_just - jour_just, 2)
+
         total_sjk = round(base_hours, 2)
-        total_just = round(min(total_sjk, actual_total_just), 2)
+        total_just = round(min(total_sjk, non_jour_just), 2)
         total_netto = round(max(0.0, total_sjk - total_just), 2)
 
         # "Sjuklön (timlön)" — paid sjuklön totals (dag 1 utanför karens + dag 2-14)
@@ -1340,19 +1414,45 @@ def process_karens_calculation(
 
 if __name__ == "__main__":
     import sys
-    
-    if len(sys.argv) < 3:
-        print("Usage: python vakant_karens_app.py <sick_list.pdf> <payslip1.pdf> [payslip2.pdf ...]")
+    from pathlib import Path as _Path
+    import glob as _glob
+
+    # Separate --sjk flag from positional args
+    sjk_path = None
+    positional = []
+    i = 1
+    while i < len(sys.argv):
+        if sys.argv[i] == "--sjk" and i + 1 < len(sys.argv):
+            sjk_path = sys.argv[i + 1]
+            i += 2
+        else:
+            positional.append(sys.argv[i])
+            i += 1
+
+    if len(positional) < 2:
+        print("Usage: python vakant_karens_app.py <sick_list.pdf> <payslip1.pdf> [payslip2.pdf ...] [--sjk <sjuklonekostnader.pdf>]")
         print("Output: vakansrapport.xlsx")
+        print()
+        print("The sjuklönekostnader PDF is auto-detected from the same directory if not specified.")
         sys.exit(1)
 
-    sick_pdf = sys.argv[1]
-    payslips = sys.argv[2:]
+    sick_pdf = positional[0]
+    payslips = positional[1:]
+
+    # Auto-detect sjuklönekostnader PDF if not explicitly provided
+    if not sjk_path:
+        sick_dir = _Path(sick_pdf).parent
+        # Look for files matching "Sjuklönekostnader*" or "Sjuklonekostnader*" in same dir
+        for pattern in ["Sjuklönekostnader*.pdf", "Sjuklonekostnader*.pdf"]:
+            candidates = list(sick_dir.glob(pattern))
+            if candidates:
+                sjk_path = str(candidates[0])
+                logger.info(f"Auto-detected sjuklönekostnader: {sjk_path}")
+                break
 
     # Derive output name from sick list filename
-    from pathlib import Path as _Path
     stem = _Path(sick_pdf).stem
     suffix = stem.replace("Sjuklista", "", 1).lstrip("_")
     output_name = f"Vakansrapport_{suffix}.xlsx" if suffix else "Vakansrapport.xlsx"
 
-    process_karens_calculation(sick_pdf, payslips, output_name)
+    process_karens_calculation(sick_pdf, payslips, output_name, sjuklonekostnader_path=sjk_path)
