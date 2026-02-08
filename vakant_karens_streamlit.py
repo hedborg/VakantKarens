@@ -22,6 +22,7 @@ from vakant_karens_app import (
     save_holidays_to_yaml,
     Config,
     CONFIG_PATH,
+    APP_VERSION,
     logger
 )
 
@@ -46,6 +47,7 @@ def main():
     )
     
     st.title("📊 Automatisk vakansberäkning")
+    st.caption(f"Version: {APP_VERSION}")
     st.markdown("""
     Beräknar karens och OB-ersättning för vakanta sjukskift baserat på uppladdade PDF-filer.
     Filerna klassificeras automatiskt baserat på filnamn:

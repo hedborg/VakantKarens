@@ -17,6 +17,8 @@ Key improvements:
   identify paid sick days that follow the karens day
 """
 
+APP_VERSION = "2025-02-08 14:30"
+
 import re
 import os
 import logging
