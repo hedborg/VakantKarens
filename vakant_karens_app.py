@@ -17,7 +17,7 @@ Key improvements:
   identify paid sick days that follow the karens day
 """
 
-APP_VERSION = "2026-02-08 17:40 CET"
+APP_VERSION = "2026-02-08 18:15 CET"
 
 import re
 import os
@@ -381,13 +381,21 @@ class SickListParser:
     def __init__(self, config: Config):
         self.config = config
 
+    # Pattern matching hours like "1,50" or "5,00"
+    _HOURS_RE = re.compile(r"^\d+,\d+$")
+
     def _extract_jour_set(self, page) -> set:
         """
         Use table extraction on a sick list page to detect jour rows.
 
-        The PDF table has separate columns for regular hours (col 3) and
-        jour hours (col 6) on the left (Sjukskriven) side.  When hours
-        appear in col 6 instead of col 3 the row is jour.
+        The PDF table has separate columns for regular hours and jour
+        hours on the left (Sjukskriven) side.  Jour rows are identified
+        by: col 0 has only a day number (no time), followed by empty
+        cells, then a time pair and hours further right.
+
+        The column layout varies between pages (17 vs 21 cols), so
+        detection is position-agnostic: we scan left-side columns for
+        the structural jour pattern.
 
         Returns a set of (day: int, start: str, end: str) tuples that
         are jour rows, used to override the text-based detection which
@@ -402,27 +410,29 @@ class SickListParser:
                 return jour_keys
 
             for row in tables[0]:
-                if len(row) < 10:
-                    continue
-                left = row[:10]
-
-                # Jour row: col 3 empty, col 6 has hours
-                has_regular = bool(left[3] and left[3].strip())
-                has_jour = bool(left[6] and left[6].strip())
-                if not has_jour or has_regular:
+                if len(row) < 8:
                     continue
 
-                # Extract day number from col 0
-                day_m = re.match(r"\s*(\d{1,2})", left[0] or "")
+                # Col 0 must have only a day number (no time merged in)
+                cell0 = (row[0] or "").strip()
+                day_m = re.match(r"^(\d{1,2})$", cell0)
                 if not day_m:
                     continue
                 day = int(day_m.group(1))
 
-                # Extract start and end times from cols 4-5
+                # Cols 1-2 must be empty (regular rows have "-" and end time)
+                if (row[1] and row[1].strip()) or (row[2] and row[2].strip()):
+                    continue
+
+                # Scan remaining left-side cols for times and hours.
+                # Look in the first ~10 columns (left/Sjukskriven side).
+                scan_limit = min(len(row), 10)
                 times = []
-                for cell in (left[4], left[5]):
-                    for tm in self._TIME_RE.finditer(cell or ""):
+                for ci in range(3, scan_limit):
+                    cell = (row[ci] or "").strip()
+                    for tm in self._TIME_RE.finditer(cell):
                         times.append(tm.group(1))
+
                 if len(times) >= 2:
                     jour_keys.add((day, times[0], times[1]))
 
@@ -1129,35 +1139,14 @@ class ReportGenerator:
             vacancy_by_ob[ob] = round(emp_detail.loc[mask, "Timmar"].sum(), 2)
 
         # Distribute vacancy hours across OB rows.
-        # The sick list uses time-based OB (e.g. "Helg") but sjuklönekostnader
-        # may use "Sjuk jourers helg". When a sick list OB class has excess vacancy
-        # beyond its sjk, the excess can fill related sjk OB classes.
-        # Mapping: sick list OB -> related sjuklönekostnader OB classes
-        OB_SPILL_MAP = {
-            "Helg": "Sjuk jourers helg",
-            "Dag": "Sjuk jourers vardag",
-        }
-
-        # First pass: assign direct matches, track excess
+        # Each OB class is capped at its sjuklönekostnader allocation.
+        # Jour is now correctly detected via table extraction, so no
+        # spill between OB classes is needed.
         just_by_ob: Dict[str, float] = {}
-        excess_pool: Dict[str, float] = {}  # keyed by sick list OB class
         for ob in ReportGenerator.OB_ROW_ORDER:
             sjk = round(sjk_hours.get(ob, 0.0), 2)
             vac = vacancy_by_ob.get(ob, 0.0)
-            direct = round(min(sjk, vac), 2)
-            just_by_ob[ob] = direct
-            if vac > sjk:
-                excess_pool[ob] = round(vac - sjk, 2)
-
-        # Second pass: spill excess vacancy into related OB classes
-        for src_ob, target_ob in OB_SPILL_MAP.items():
-            if src_ob in excess_pool and excess_pool[src_ob] > 0:
-                target_sjk = round(sjk_hours.get(target_ob, 0.0), 2)
-                target_filled = just_by_ob.get(target_ob, 0.0)
-                target_room = round(max(0.0, target_sjk - target_filled), 2)
-                spill = round(min(excess_pool[src_ob], target_room), 2)
-                just_by_ob[target_ob] = round(target_filled + spill, 2)
-                excess_pool[src_ob] = round(excess_pool[src_ob] - spill, 2)
+            just_by_ob[ob] = round(min(sjk, vac), 2)
 
         # Build individual OB rows (without Dag)
         for ob in ReportGenerator.OB_SECTION_ORDER:
