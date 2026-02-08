@@ -1,0 +1,13 @@
+# Core dependencies
+pandas>=2.0.0
+pdfplumber>=0.10.0
+openpyxl>=3.1.0
+
+# For Streamlit web app
+streamlit>=1.30.0
+
+# Configuration
+pyyaml>=6.0
+
+# Optional: for better performance
+# numpy>=1.24.0

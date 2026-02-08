@@ -1,0 +1,5 @@
+cd C:\VakantKarens
+
+setup.bat
+
+start_web.bat

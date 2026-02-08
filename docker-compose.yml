@@ -1,0 +1,37 @@
+version: '3.8'
+
+services:
+  vakant-karens-app:
+    build: .
+    container_name: automatisk-vakansberakning
+    ports:
+      - "8501:8501"
+    volumes:
+      # Mount local directories for input/output files (optional)
+      - ./input:/app/input
+      - ./output:/app/output
+    environment:
+      # Streamlit configuration
+      - STREAMLIT_SERVER_HEADLESS=true
+      - STREAMLIT_BROWSER_GATHER_USAGE_STATS=false
+      - STREAMLIT_SERVER_MAX_UPLOAD_SIZE=200
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8501/_stcore/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 40s
+
+# Optional: Add a reverse proxy (nginx) for production
+#   nginx:
+#     image: nginx:alpine
+#     ports:
+#       - "80:80"
+#       - "443:443"
+#     volumes:
+#       - ./nginx.conf:/etc/nginx/nginx.conf
+#       - ./ssl:/etc/nginx/ssl
+#     depends_on:
+#       - vakant-karens-app
+#     restart: unless-stopped
