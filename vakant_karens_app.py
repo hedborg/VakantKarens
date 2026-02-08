@@ -17,7 +17,7 @@ Key improvements:
   identify paid sick days that follow the karens day
 """
 
-APP_VERSION = "2026-02-08 17:25 CET"
+APP_VERSION = "2026-02-08 17:40 CET"
 
 import re
 import os
@@ -233,14 +233,22 @@ class PayslipParser:
     def __init__(self, config: Config):
         self.config = config
     
-    # Matches lines like:
+    # Matches actual timlön salary lines like:
     #   "11 Timlön direkt sem.ersättning [5001EL] 139,5 tim 156,00 21 762,00"
     #   "114 Timlön direkt sem.ersättning, KOM [ZS] 6,00 tim 150,00"
     #   "Timlön exkl. sem.ersättning [013GA] 120,00 tim 193,00 23 160,00"
-    # Optional code prefix (11, 114, …), followed by "Timlön", with rate after "tim"
+    # Requires either a code prefix (11, 114, …) immediately before "Timlön",
+    # or "Timlön" at the start of the line. This avoids matching semester
+    # settlement lines (2295/2296/2297) where "timlön" appears mid-description.
     TIMLON_PATTERN = re.compile(
-        r"(?:\b11\d{0,2}\b\s+)?Timlön.*?(\d+[,\.]\d+)\s*tim\s+(\d+[,\.]\d+)",
-        re.IGNORECASE,
+        r"(?:\b11\d{0,2}\b\s+|^)Timlön.*?(\d+[,\.]\d+)\s*tim\s+(\d+[,\.]\d+)",
+        re.IGNORECASE | re.MULTILINE,
+    )
+
+    # Fallback: extract timlön from sjuklön dag -14 line (4320).
+    # The rate on that line is 80% of the real timlön.
+    SJUKLON_TIMLON_PATTERN = re.compile(
+        r"\b4320\b.*?(\d+[,\.]\d+)\s*tim\s+(\d+[,\.]\d+)",
     )
 
     def parse_multiple(self, payslip_paths: List[str]) -> Tuple[Dict, Dict, Dict, Dict, Dict]:
@@ -323,6 +331,15 @@ class PayslipParser:
                 for m_tim in self.TIMLON_PATTERN.finditer(text):
                     rate = PersonnummerParser.parse_float_sv(m_tim.group(2))
                     rates_found.add(rate)
+
+                # Fallback: derive timlön from sjuklön 4320 line (rate is 80%)
+                if not rates_found:
+                    for m_sjk in self.SJUKLON_TIMLON_PATTERN.finditer(text):
+                        sjk_rate = PersonnummerParser.parse_float_sv(m_sjk.group(2))
+                        derived = round(sjk_rate / 0.8, 2)
+                        rates_found.add(derived)
+                        logger.debug(f"  Timlön fallback from 4320: {sjk_rate} kr (80%) -> {derived} kr (100%)")
+
                 if rates_found:
                     primary_rate = max(rates_found)  # use highest as primary
                     multi = len(rates_found) > 1
