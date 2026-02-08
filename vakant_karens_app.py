@@ -496,12 +496,13 @@ class SjuklonekostnaderParser:
     # Pattern to detect personnummer lines: "Name    YYYYMMDD-XXXX"
     PNR_PATTERN = re.compile(r"(\d{8})-(\d{4})")
     # Pattern to extract date range and hours: "2025-09-01 - 2025-09-02  9,03 tim"
+    # The "tim" suffix is optional — some PDFs omit it
     RANGE_PATTERN = re.compile(
-        r"(\d{4}-\d{2}-\d{2})\s*-\s*(\d{4}-\d{2}-\d{2})\s+(\d+[,\.]\d+)\s*tim"
+        r"(\d{4}-\d{2}-\d{2})\s*-\s*(\d{4}-\d{2}-\d{2})\s+(\d+[,\.]\d+)\s*(?:tim)?"
     )
     # Pattern for single-date lines: "2025-09-01  2,30 tim"
     SINGLE_DATE_PATTERN = re.compile(
-        r"(\d{4}-\d{2}-\d{2})\s+(\d+[,\.]\d+)\s*tim"
+        r"(\d{4}-\d{2}-\d{2})\s+(\d+[,\.]\d+)\s*(?:tim)?"
     )
 
     def __init__(self, config: Config):
@@ -583,6 +584,10 @@ class SjuklonekostnaderParser:
                 continue
 
             line_lower = line.lower()
+
+            # Skip semesterersättning lines — these contain monetary amounts, not hours
+            if "semesterersättning" in line_lower:
+                continue
 
             # Try date range pattern first, then single date
             m_range = self.RANGE_PATTERN.search(line)
