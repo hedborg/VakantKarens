@@ -15,23 +15,17 @@ from typing import List
 import pandas as pd
 
 # Import from the main app
-try:
-    from vakant_karens_app import (
-        process_karens_calculation,
-        load_config,
-        load_holidays_from_yaml,
-        save_holidays_to_yaml,
-        load_berakningsar_rates,
-        Config,
-        CONFIG_PATH,
-        APP_VERSION,
-        logger
-    )
-except ImportError as e:
-    st.error(f"Import error: {e}")
-    import traceback
-    st.code(traceback.format_exc())
-    st.stop()
+from vakant_karens_app import (
+    process_karens_calculation,
+    load_config,
+    load_holidays_from_yaml,
+    save_holidays_to_yaml,
+    load_berakningsar_rates,
+    Config,
+    CONFIG_PATH,
+    APP_VERSION,
+    logger
+)
 
 
 def pdf_download(uploaded_file, label=None, key=None):
