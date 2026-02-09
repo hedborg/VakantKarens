@@ -47,7 +47,7 @@ class Config:
     sick_row_pattern: str = r"^\s*(\d{1,2})\s+(\d{2}:\d{2})\s*-\s*(\d{2}:\d{2})\s+(\d+,\d+)\s+(.*)$"
     payslip_anst_pattern: str = r"Anställningsnr\s*:\s*(\d+)"
     karens_codes: List[str] = None
-    sick_day_pattern: str = r"4320"  # Code for sjuklön dag -14 (days 2-14)
+    sick_day_pattern: str = r"432(?:0)?"  # Code for sjuklön dag -14 (days 2-14): matches 432 and 4320
     gt14_pattern: str = r"dag\s*15--"
     
     def __post_init__(self):
@@ -88,6 +88,37 @@ def save_holidays_to_yaml(holidays: List[date], config_path: Path = CONFIG_PATH)
     with open(config_path, "w", encoding="utf-8") as f:
         yaml.dump(data, f, default_flow_style=False, allow_unicode=True, sort_keys=False)
     logger.info(f"Saved {len(holidays)} holidays to {config_path}")
+
+
+def load_berakningsar_rates(year: str, config_path: Path = CONFIG_PATH) -> Optional[Dict]:
+    """Load cost rates for a given beräkningsår from config.yaml"""
+    try:
+        if not config_path.exists():
+            return None
+        with open(config_path, "r", encoding="utf-8") as f:
+            data = yaml.safe_load(f)
+        if not data or "berakningsar" not in data:
+            return None
+        rates = data["berakningsar"].get(str(year))
+        if rates:
+            logger.info(f"Loaded beräkningsår rates for {year}")
+        else:
+            logger.warning(f"No beräkningsår rates found for {year}")
+        return rates
+    except Exception as e:
+        logger.warning(f"Could not load beräkningsår rates: {e}")
+        return None
+
+
+# Mapping from OB class names (used in code) to config.yaml rate keys
+OB_RATE_KEYS = {
+    "Sjuk jourers helg": "helg_jour",
+    "Sjuk jourers vardag": "vardag_jour",
+    "Storhelg": "helg_stor",
+    "Helg": "helg",
+    "Natt": "vardag_natt",
+    "Kväll": "vardag_kvall",
+}
 
 
 def load_config(holidays: Optional[List[date]] = None, config_path: Path = CONFIG_PATH) -> Config:
@@ -245,10 +276,10 @@ class PayslipParser:
         re.IGNORECASE | re.MULTILINE,
     )
 
-    # Fallback: extract timlön from sjuklön dag -14 line (4320).
+    # Fallback: extract timlön from sjuklön dag -14 line (4320 or 432).
     # The rate on that line is 80% of the real timlön.
     SJUKLON_TIMLON_PATTERN = re.compile(
-        r"\b4320\b.*?(\d+[,\.]\d+)\s*tim\s+(\d+[,\.]\d+)",
+        r"\b432(?:0)?\b.*?(\d+[,\.]\d+)\s*tim\s+(\d+[,\.]\d+)",
     )
 
     def parse_multiple(self, payslip_paths: List[str]) -> Tuple[Dict, Dict, Dict, Dict, Dict]:
@@ -1104,21 +1135,37 @@ class ReportGenerator:
         sjk_hours: Dict[str, float],
         karens_hours: float = 0.0,
         base_hours: float = 0.0,
+        timlon_rate: Optional[float] = None,
+        rates: Optional[Dict] = None,
+        under_23: bool = False,
     ) -> List[Dict]:
         """
         Build data for the per-employee sheet.
 
         Returns a list of dicts with keys:
-          ob_class, display_name, sjk_timmar, justering_timmar, netto_timmar
+          ob_class, display_name, sjk_timmar, sjk_kronor,
+          justering_timmar, justering_kronor, netto_timmar, netto_kronor
 
         sjk_hours: paid sjuklön hours by OB class (karens excluded)
         karens_hours: total karens hours from sjuklönekostnader parser
         base_hours: total base paid hours from sjuklönekostnader (excl supplements)
+        timlon_rate: 100% hourly rate for the employee
+        rates: beräkningsår rates dict from config
+        under_23: whether the employee is under 23
 
         Special ob_class values:
-          "_summary"  — "Sjuklön (timlön)" totals (paid statuses only)
-          "_gt14"     — "Semesterers sjuklön (Karens och >14)"
+          "_summary"    — "Sjuklön (timlön)" totals (paid statuses only)
+          "_sem_sjk"    — "Semesterersättning sjuklön" (semester_ersattning % of sjuklön)
+          "_gt14"       — "Semesterers sjuklön (Karens och >14)"
+          "_sjk_exkl"   — "Sjuklön exkl sem ers" subtotal
+          "_sem_ers"    — "Semesterersättning" subtotal
+          "_sjuklon"    — "Sjuklön" subtotal
+          "_forsakring" — "Försäkringar"
+          "_soc_avg"    — "Sociala avgifter"
+          "_summa"      — "Summa Sjuklönekostnader"
         """
+        sjklon_procent = rates.get("sjuklon_procent", 0.80) if rates else 0.80
+        timlon_80 = round(timlon_rate * sjklon_procent, 2) if timlon_rate else 0.0
         rows = []
 
         # Gather total paid vacancy hours from sick list detail
@@ -1148,17 +1195,28 @@ class ReportGenerator:
             vac = vacancy_by_ob.get(ob, 0.0)
             just_by_ob[ob] = round(min(sjk, vac), 2)
 
+        # Helper to get OB rate from config (at sjuklön %)
+        def ob_rate(ob_class: str) -> float:
+            if not rates:
+                return 0.0
+            key = OB_RATE_KEYS.get(ob_class)
+            return round(rates.get(key, 0.0) * sjklon_procent, 2) if key else 0.0
+
         # Build individual OB rows (without Dag)
         for ob in ReportGenerator.OB_SECTION_ORDER:
             sjk = round(sjk_hours.get(ob, 0.0), 2)
             just = just_by_ob.get(ob, 0.0)
             netto = round(max(0.0, sjk - just), 2)
+            rate = ob_rate(ob)
             rows.append({
                 "ob_class": ob,
                 "display_name": ReportGenerator.OB_DISPLAY_NAMES[ob],
                 "sjk_timmar": sjk,
+                "sjk_kronor": round(sjk * rate, 2),
                 "justering_timmar": just,
+                "justering_kronor": round(just * rate, 2),
                 "netto_timmar": netto,
+                "netto_kronor": round(netto * rate, 2),
             })
 
         # "Sjuklön (timlön)" — use base hours (not sum of OB rows which includes supplements)
@@ -1180,8 +1238,28 @@ class ReportGenerator:
             "ob_class": "_summary",
             "display_name": "Sjuklön (timlön)",
             "sjk_timmar": total_sjk,
+            "sjk_kronor": round(total_sjk * timlon_80, 2),
             "justering_timmar": total_just,
+            "justering_kronor": round(total_just * timlon_80, 2),
             "netto_timmar": total_netto,
+            "netto_kronor": round(total_netto * timlon_80, 2),
+        })
+
+        # "Semesterersättning sjuklön" (semester_ersattning % of sjuklön, based on 100% timlön)
+        sem_pct = rates.get("semester_ersattning", 0.12) if rates else 0.12
+        timlon_100 = timlon_rate if timlon_rate else 0.0
+        sem_sjk_sjk_kr = round(total_sjk * timlon_100, 2)
+        sem_sjk_just_kr = round(total_just * timlon_100, 2)
+        sem_sjk_netto_kr = round(total_netto * timlon_100, 2)
+        rows.append({
+            "ob_class": "_sem_sjk",
+            "display_name": "Semesterersättning sjuklön",
+            "sjk_timmar": sem_pct,
+            "sjk_kronor": round(sem_sjk_sjk_kr * sem_pct, 2),
+            "justering_timmar": sem_pct,
+            "justering_kronor": round(sem_sjk_just_kr * sem_pct, 2),
+            "netto_timmar": sem_pct,
+            "netto_kronor": round(sem_sjk_netto_kr * sem_pct, 2),
         })
 
         # "Semesterers sjuklön (Karens och >14)"
@@ -1203,11 +1281,135 @@ class ReportGenerator:
             "ob_class": "_gt14",
             "display_name": "Semesterers sjuklön (Karens och >14)",
             "sjk_timmar": karens_sjk,
+            "sjk_kronor": round(karens_sjk * timlon_100 * sem_pct, 2),
             "justering_timmar": gt14_karens_just,
+            "justering_kronor": round(gt14_karens_just * timlon_100 * sem_pct, 2),
             "netto_timmar": sem_netto,
+            "netto_kronor": round(sem_netto * timlon_100 * sem_pct, 2),
+        })
+
+        # ── Cost summary rows ──
+        # Salary rows = OB rows + _summary (timlön), excludes semesterersättning
+        SALARY_CLASSES = {ob for ob in ReportGenerator.OB_SECTION_ORDER} | {"_summary"}
+        SEM_CLASSES = {"_sem_sjk", "_gt14"}
+
+        def sum_kr_by(classes, key: str) -> float:
+            return round(sum(r[key] for r in rows if r["ob_class"] in classes), 2)
+
+        # "Sjuklön exkl sem ers" = sum of salary parts only
+        sjk_exkl_sjk = sum_kr_by(SALARY_CLASSES, "sjk_kronor")
+        sjk_exkl_just = sum_kr_by(SALARY_CLASSES, "justering_kronor")
+        sjk_exkl_netto = sum_kr_by(SALARY_CLASSES, "netto_kronor")
+        rows.append({
+            "ob_class": "_sjk_exkl",
+            "display_name": "Sjuklön exkl sem ers",
+            "sjk_timmar": None,
+            "sjk_kronor": sjk_exkl_sjk,
+            "justering_timmar": None,
+            "justering_kronor": sjk_exkl_just,
+            "netto_timmar": None,
+            "netto_kronor": sjk_exkl_netto,
+        })
+
+        # "Semesterersättning" = sum of semesterersättning rows (_sem_sjk + _gt14)
+        sem_ers_sjk = sum_kr_by(SEM_CLASSES, "sjk_kronor")
+        sem_ers_just = sum_kr_by(SEM_CLASSES, "justering_kronor")
+        sem_ers_netto = sum_kr_by(SEM_CLASSES, "netto_kronor")
+        rows.append({
+            "ob_class": "_sem_ers",
+            "display_name": "Semesterersättning",
+            "sjk_timmar": None,
+            "sjk_kronor": sem_ers_sjk,
+            "justering_timmar": None,
+            "justering_kronor": sem_ers_just,
+            "netto_timmar": None,
+            "netto_kronor": sem_ers_netto,
+        })
+
+        # "Sjuklön" subtotal = sjk exkl + semesterersättning
+        sjuklon_sjk = round(sjk_exkl_sjk + sem_ers_sjk, 2)
+        sjuklon_just = round(sjk_exkl_just + sem_ers_just, 2)
+        sjuklon_netto = round(sjk_exkl_netto + sem_ers_netto, 2)
+        rows.append({
+            "ob_class": "_sjuklon",
+            "display_name": "Sjuklön",
+            "sjk_timmar": None,
+            "sjk_kronor": sjuklon_sjk,
+            "justering_timmar": None,
+            "justering_kronor": sjuklon_just,
+            "netto_timmar": None,
+            "netto_kronor": sjuklon_netto,
+        })
+
+        # "Försäkringar"
+        forsakring_pct = 0.0
+        if rates:
+            if under_23:
+                forsakring_pct = rates.get("forsakring_procent_under25", 0.0)
+            else:
+                forsakring_pct = rates.get("forsakring_procent", 0.0)
+        rows.append({
+            "ob_class": "_forsakring",
+            "display_name": "Försäkringar",
+            "sjk_timmar": forsakring_pct,
+            "sjk_kronor": round(sjuklon_sjk * forsakring_pct, 2),
+            "justering_timmar": forsakring_pct,
+            "justering_kronor": round(sjuklon_just * forsakring_pct, 2),
+            "netto_timmar": forsakring_pct,
+            "netto_kronor": round(sjuklon_netto * forsakring_pct, 2),
+        })
+
+        # "Sociala avgifter"
+        soc_avg_pct = rates.get("sociala_avgifter", 0.3142) if rates else 0.3142
+        rows.append({
+            "ob_class": "_soc_avg",
+            "display_name": "Sociala avgifter",
+            "sjk_timmar": soc_avg_pct,
+            "sjk_kronor": round(sjuklon_sjk * soc_avg_pct, 2),
+            "justering_timmar": soc_avg_pct,
+            "justering_kronor": round(sjuklon_just * soc_avg_pct, 2),
+            "netto_timmar": soc_avg_pct,
+            "netto_kronor": round(sjuklon_netto * soc_avg_pct, 2),
+        })
+
+        # "Summa Sjuklönekostnader"
+        forsakring_row = rows[-2]
+        soc_avg_row = rows[-1]
+        sjuklon_row = [r for r in rows if r["ob_class"] == "_sjuklon"][0]
+        summa_sjk = round(sjuklon_row["sjk_kronor"] + forsakring_row["sjk_kronor"] + soc_avg_row["sjk_kronor"], 2)
+        summa_just = round(sjuklon_row["justering_kronor"] + forsakring_row["justering_kronor"] + soc_avg_row["justering_kronor"], 2)
+        summa_netto = round(sjuklon_row["netto_kronor"] + forsakring_row["netto_kronor"] + soc_avg_row["netto_kronor"], 2)
+        rows.append({
+            "ob_class": "_summa",
+            "display_name": "Summa Sjuklönekostnader",
+            "sjk_timmar": None,
+            "sjk_kronor": summa_sjk,
+            "justering_timmar": None,
+            "justering_kronor": summa_just,
+            "netto_timmar": None,
+            "netto_kronor": summa_netto,
         })
 
         return rows
+
+    # Row groups for Excel layout
+    # OB rows: displayed with Timmar + Kronor
+    # Summary section 1: _summary, _sem_sjk, _gt14 (Timmar + Kronor)
+    # Blank row
+    # Summary section 2: _sjk_exkl, _sem_ers, _sjuklon (Kronor only)
+    # Blank row
+    # Fees: _forsakring, _soc_avg (% + Kronor)
+    # Blank row
+    # Total: _summa (Kronor only)
+
+    SUMMARY_SECTION_1 = {"_summary", "_sem_sjk", "_gt14"}
+    SUMMARY_SECTION_2 = {"_sjk_exkl", "_sem_ers", "_sjuklon"}
+    FEES_SECTION = {"_forsakring", "_soc_avg"}
+    TOTAL_SECTION = {"_summa"}
+    # Rows where Timmar column shows a percentage instead
+    PERCENT_ROWS = {"_sem_sjk", "_forsakring", "_soc_avg"}
+    # Rows that have no Timmar value at all
+    NO_TIMMAR_ROWS = {"_sjk_exkl", "_sem_ers", "_sjuklon", "_summa"}
 
     @staticmethod
     def save_excel(
@@ -1218,6 +1420,8 @@ class ReportGenerator:
         sjk_base_hours: Optional[Dict[str, float]] = None,
         timlon_map: Optional[Dict[str, float]] = None,
         file_code: str = "",
+        rates: Optional[Dict] = None,
+        berakningsar: str = "",
     ):
         """Save detailed report + per-employee sheets to Excel"""
         if sjk_total_hours is None:
@@ -1233,14 +1437,19 @@ class ReportGenerator:
         parts = file_code.split("_", 1)
         brukare = parts[0] if len(parts) >= 1 else ""
         period = parts[1] if len(parts) >= 2 else ""
-        year = period[:4] if len(period) >= 4 else ""
+        year = berakningsar or (period[:4] if len(period) >= 4 else "")
 
         with pd.ExcelWriter(output_path, engine="openpyxl") as writer:
             # Sheet 1: Full detail
             detail.to_excel(writer, sheet_name="Detalj", index=False)
+            # Set Detalj column widths (25 for columns with content)
+            ws_det = writer.sheets["Detalj"]
+            for col_letter in ["A", "B", "C", "D", "E", "F", "G", "H", "I", "J", "K"]:
+                ws_det.column_dimensions[col_letter].width = 25
 
-            # Per-employee sheets
+            # Per-employee sheets — collect netto totals for summary
             used_names = set()
+            summary_rows = []  # (nyckel, netto_kronor)
             for pnr in detail["Personnummer"].unique():
                 emp = detail[detail["Personnummer"] == pnr]
                 anst = emp["Anställningsnr"].iloc[0]
@@ -1250,7 +1459,39 @@ class ReportGenerator:
 
                 emp_karens_hrs = sjk_karens_hours.get(pnr, 0.0)
                 emp_base_hrs = sjk_base_hours.get(pnr, 0.0)
-                sheet_data = ReportGenerator.create_employee_sheet_data(emp, sjk_hrs, emp_karens_hrs, emp_base_hrs)
+
+                # Determine under_23 status
+                under_23 = False
+                under_23_str = "nej"
+                if len(pnr) >= 8 and period:
+                    try:
+                        birth = date(int(pnr[:4]), int(pnr[4:6]), int(pnr[6:8]))
+                        p_year = int(period[:4])
+                        p_month = int(period[4:6])
+                        if p_month == 12:
+                            end_of_month = date(p_year + 1, 1, 1) - timedelta(days=1)
+                        else:
+                            end_of_month = date(p_year, p_month + 1, 1) - timedelta(days=1)
+                        try:
+                            birthday_23 = date(birth.year + 23, birth.month, birth.day)
+                        except ValueError:
+                            birthday_23 = date(birth.year + 23, 3, 1)
+                        if birthday_23 > end_of_month:
+                            under_23 = True
+                            under_23_str = "ja"
+                    except (ValueError, IndexError):
+                        pass
+
+                sheet_data = ReportGenerator.create_employee_sheet_data(
+                    emp, sjk_hrs, emp_karens_hrs, emp_base_hrs,
+                    timlon_rate=timlon_rate, rates=rates, under_23=under_23,
+                )
+
+                # Capture justering total for summary sheet (vacancy cost)
+                summa_row = next((r for r in sheet_data if r["ob_class"] == "_summa"), None)
+                nyckel = f"{brukare}_{period}_{anst}" if anst else pnr
+                just_total = summa_row["justering_kronor"] if summa_row else 0.0
+                summary_rows.append((nyckel, just_total))
 
                 # Build sheet name (max 31 chars for Excel)
                 sheet_name = str(anst)[:31] if anst else pnr[:31]
@@ -1262,6 +1503,8 @@ class ReportGenerator:
                 used_names.add(sheet_name)
 
                 ws = writer.book.create_sheet(sheet_name)
+
+                sjklon_procent = rates.get("sjuklon_procent", 0.80) if rates else 0.80
 
                 # ── Metadata (rows 1-10) ──
                 ws["A1"] = "Brukare"
@@ -1277,35 +1520,14 @@ class ReportGenerator:
                 ws["B4"] = f"{brukare}_{period}_{anst}" if anst else ""
 
                 ws["A5"] = "Under 23"
-                # Under 23 = "ja" if 23rd birthday is AFTER the end of the sick month
-                under_23 = "nej"
-                if len(pnr) >= 8 and period:
-                    try:
-                        birth = date(int(pnr[:4]), int(pnr[4:6]), int(pnr[6:8]))
-                        p_year = int(period[:4])
-                        p_month = int(period[4:6])
-                        # End of sick month
-                        if p_month == 12:
-                            end_of_month = date(p_year + 1, 1, 1) - timedelta(days=1)
-                        else:
-                            end_of_month = date(p_year, p_month + 1, 1) - timedelta(days=1)
-                        # 23rd birthday (handle Feb 29 → use Mar 1 in non-leap years)
-                        try:
-                            birthday_23 = date(birth.year + 23, birth.month, birth.day)
-                        except ValueError:
-                            birthday_23 = date(birth.year + 23, 3, 1)
-                        if birthday_23 > end_of_month:
-                            under_23 = "ja"
-                    except (ValueError, IndexError):
-                        pass
-                ws["B5"] = under_23
+                ws["B5"] = under_23_str
 
                 ws["A6"] = "Timlön (80%)"
-                ws["B6"] = round(timlon_rate * 0.8, 2) if timlon_rate else ""
+                ws["B6"] = round(timlon_rate * sjklon_procent, 2) if timlon_rate else ""
 
                 ws["A7"] = "Sjuklönprocent"
                 if timlon_rate:
-                    ws["B7"] = 0.80
+                    ws["B7"] = sjklon_procent
                     ws["B7"].number_format = '0.00%'
 
                 ws["A8"] = "Timlön (100%)"
@@ -1313,45 +1535,121 @@ class ReportGenerator:
 
                 ws["A9"] = "Beräkningsår"
                 ws["B9"] = int(year) if year else ""
-                ws["C9"] = "Text"
 
                 ws["A10"] = "Beräknare"
                 ws["B10"] = "APP"
 
                 # ── Table (rows 11+) ──
-                # Group headers
-                ws["B11"] = "Enligt sjuklönekostnader"
-                ws["C11"] = "Justering för vakanser"
-                ws["D11"] = "Netto"
-                # Row 12 blank
-                # Sub-headers
-                ws["B13"] = "Timmar"
-                ws["C13"] = "Timmar"
-                ws["D13"] = "Timmar"
+                # Column layout: A=label, B=sjk_timmar, C=sjk_kronor,
+                #   D=just_timmar, E=just_kronor, F=netto_timmar, G=netto_kronor
 
-                # OB data rows (14-19)
+                # Group headers (row 11)
+                ws.cell(row=11, column=2, value="Enligt sjuklönekostnader")
+                ws.cell(row=11, column=4, value="Justering för vakanser")
+                ws.cell(row=11, column=6, value="Netto")
+
+                # Sub-headers (row 13)
+                ws.cell(row=13, column=2, value="Timmar")
+                ws.cell(row=13, column=3, value="Kronor")
+                ws.cell(row=13, column=4, value="Timmar")
+                ws.cell(row=13, column=5, value="Kronor")
+                ws.cell(row=13, column=6, value="Timmar")
+                ws.cell(row=13, column=7, value="Kronor")
+
+                # ── Write data rows ──
                 row_num = 14
+
+                # Helper to write one data row
+                def write_row(item, rn):
+                    oc = item["ob_class"]
+                    ws.cell(row=rn, column=1, value=item["display_name"])
+
+                    if oc in ReportGenerator.NO_TIMMAR_ROWS:
+                        # Kronor only — no Timmar columns
+                        ws.cell(row=rn, column=3, value=item.get("sjk_kronor", 0.0))
+                        ws.cell(row=rn, column=5, value=item.get("justering_kronor", 0.0))
+                        ws.cell(row=rn, column=7, value=item.get("netto_kronor", 0.0))
+                    elif oc in ReportGenerator.PERCENT_ROWS:
+                        # Timmar column shows percentage, plus Kronor
+                        pct_val = item.get("sjk_timmar", 0.0)
+                        ws.cell(row=rn, column=2, value=pct_val)
+                        ws.cell(row=rn, column=2).number_format = '0.00%'
+                        ws.cell(row=rn, column=3, value=item.get("sjk_kronor", 0.0))
+                        ws.cell(row=rn, column=4, value=pct_val)
+                        ws.cell(row=rn, column=4).number_format = '0.00%'
+                        ws.cell(row=rn, column=5, value=item.get("justering_kronor", 0.0))
+                        ws.cell(row=rn, column=6, value=pct_val)
+                        ws.cell(row=rn, column=6).number_format = '0.00%'
+                        ws.cell(row=rn, column=7, value=item.get("netto_kronor", 0.0))
+                    else:
+                        # Normal: Timmar + Kronor
+                        ws.cell(row=rn, column=2, value=item.get("sjk_timmar", 0.0))
+                        ws.cell(row=rn, column=3, value=item.get("sjk_kronor", 0.0))
+                        ws.cell(row=rn, column=4, value=item.get("justering_timmar", 0.0))
+                        ws.cell(row=rn, column=5, value=item.get("justering_kronor", 0.0))
+                        ws.cell(row=rn, column=6, value=item.get("netto_timmar", 0.0))
+                        ws.cell(row=rn, column=7, value=item.get("netto_kronor", 0.0))
+
+                # OB rows (14-19)
                 for item in sheet_data:
-                    if item["ob_class"].startswith("_"):
-                        continue  # skip summary rows for now
-                    ws.cell(row=row_num, column=1, value=item["display_name"])
-                    ws.cell(row=row_num, column=2, value=item["sjk_timmar"])
-                    ws.cell(row=row_num, column=3, value=item["justering_timmar"])
-                    ws.cell(row=row_num, column=4, value=item["netto_timmar"])
-                    row_num += 1
+                    if not item["ob_class"].startswith("_"):
+                        write_row(item, row_num)
+                        row_num += 1
 
                 # Blank separator
                 row_num += 1
 
-                # Summary rows (_summary, _gt14, etc.)
+                # Summary section 1: Sjuklön (timlön), Semesterersättning sjuklön, Karens/GT14
                 for item in sheet_data:
-                    if not item["ob_class"].startswith("_"):
-                        continue
-                    ws.cell(row=row_num, column=1, value=item["display_name"])
-                    ws.cell(row=row_num, column=2, value=item["sjk_timmar"])
-                    ws.cell(row=row_num, column=3, value=item["justering_timmar"])
-                    ws.cell(row=row_num, column=4, value=item["netto_timmar"])
-                    row_num += 1
+                    if item["ob_class"] in ReportGenerator.SUMMARY_SECTION_1:
+                        write_row(item, row_num)
+                        row_num += 1
+
+                # Blank separator
+                row_num += 1
+
+                # Summary section 2: Sjuklön exkl, Semesterersättning, Sjuklön subtotal
+                for item in sheet_data:
+                    if item["ob_class"] in ReportGenerator.SUMMARY_SECTION_2:
+                        write_row(item, row_num)
+                        row_num += 1
+
+                # Fees: Försäkringar, Sociala avgifter
+                for item in sheet_data:
+                    if item["ob_class"] in ReportGenerator.FEES_SECTION:
+                        write_row(item, row_num)
+                        row_num += 1
+
+                # Blank separator
+                row_num += 1
+
+                # Total: Summa Sjuklönekostnader
+                for item in sheet_data:
+                    if item["ob_class"] in ReportGenerator.TOTAL_SECTION:
+                        write_row(item, row_num)
+                        row_num += 1
+
+                # Set employee sheet column widths
+                for col_letter in ["A", "B", "C", "D", "E", "F", "G"]:
+                    ws.column_dimensions[col_letter].width = 25
+
+            # ── Summary sheet: Vakanssammanfattning ──
+            ws_sum = writer.book.create_sheet("Vakanssammanfattning", 0)  # insert first
+            ws_sum["A1"] = "Vakanskostnader"
+            row_num = 2
+            grand_total = 0.0
+            for nyckel, netto_kr in summary_rows:
+                ws_sum.cell(row=row_num, column=1, value=nyckel)
+                ws_sum.cell(row=row_num, column=2, value=netto_kr)
+                grand_total += netto_kr
+                row_num += 1
+            row_num += 1
+            ws_sum.cell(row=row_num, column=1, value="Totala vakanskostnader")
+            ws_sum.cell(row=row_num, column=2, value=round(grand_total, 2))
+
+            # Set Vakanssammanfattning column widths
+            ws_sum.column_dimensions["A"].width = 25
+            ws_sum.column_dimensions["B"].width = 25
 
         logger.info(f"Excel report saved: {output_path} ({len(used_names)} employee sheets)")
 
@@ -1361,7 +1659,8 @@ def process_karens_calculation(
     payslip_paths: List[str],
     output_xlsx: str,
     config: Optional[Config] = None,
-    sjuklonekostnader_path: Optional[str] = None
+    sjuklonekostnader_path: Optional[str] = None,
+    berakningsar_override: Optional[str] = None,
 ):
     """Main processing function"""
     if config is None:
@@ -1414,8 +1713,26 @@ def process_karens_calculation(
     file_code = sick_stem.replace("Sjuklista", "", 1).lstrip("_") or ""
     detail.insert(0, "Kod", file_code)
 
+    # Load beräkningsår rates for cost calculation
+    if berakningsar_override:
+        berakningsar = berakningsar_override
+    else:
+        parts = file_code.split("_", 1)
+        period = parts[1] if len(parts) >= 2 else ""
+        berakningsar = period[:4] if len(period) >= 4 else ""
+    rates = load_berakningsar_rates(berakningsar) if berakningsar else None
+
     # Save
-    ReportGenerator.save_excel(detail, output_xlsx, sjk_total_hours=sjk_total_hours, sjk_karens_hours=sjk_karens_hours, sjk_base_hours=sjk_base_hours, timlon_map=timlon_map, file_code=file_code)
+    ReportGenerator.save_excel(
+        detail, output_xlsx,
+        sjk_total_hours=sjk_total_hours,
+        sjk_karens_hours=sjk_karens_hours,
+        sjk_base_hours=sjk_base_hours,
+        timlon_map=timlon_map,
+        file_code=file_code,
+        rates=rates,
+        berakningsar=berakningsar,
+    )
 
 
 if __name__ == "__main__":
@@ -1423,23 +1740,28 @@ if __name__ == "__main__":
     from pathlib import Path as _Path
     import glob as _glob
 
-    # Separate --sjk flag from positional args
+    # Separate --sjk and --year flags from positional args
     sjk_path = None
+    year_override = None
     positional = []
     i = 1
     while i < len(sys.argv):
         if sys.argv[i] == "--sjk" and i + 1 < len(sys.argv):
             sjk_path = sys.argv[i + 1]
             i += 2
+        elif sys.argv[i] == "--year" and i + 1 < len(sys.argv):
+            year_override = sys.argv[i + 1]
+            i += 2
         else:
             positional.append(sys.argv[i])
             i += 1
 
     if len(positional) < 2:
-        print("Usage: python vakant_karens_app.py <sick_list.pdf> <payslip1.pdf> [payslip2.pdf ...] [--sjk <sjuklonekostnader.pdf>]")
+        print("Usage: python vakant_karens_app.py <sick_list.pdf> <payslip1.pdf> [payslip2.pdf ...] [--sjk <sjuklonekostnader.pdf>] [--year <YYYY>]")
         print("Output: vakansrapport.xlsx")
         print()
         print("The sjuklönekostnader PDF is auto-detected from the same directory if not specified.")
+        print("The --year flag overrides the beräkningsår (default: derived from period).")
         sys.exit(1)
 
     sick_pdf = positional[0]
@@ -1461,4 +1783,4 @@ if __name__ == "__main__":
     suffix = stem.replace("Sjuklista", "", 1).lstrip("_")
     output_name = f"Vakansrapport_{suffix}.xlsx" if suffix else "Vakansrapport.xlsx"
 
-    process_karens_calculation(sick_pdf, payslips, output_name, sjuklonekostnader_path=sjk_path)
+    process_karens_calculation(sick_pdf, payslips, output_name, sjuklonekostnader_path=sjk_path, berakningsar_override=year_override)

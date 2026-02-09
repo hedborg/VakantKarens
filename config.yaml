@@ -113,6 +113,127 @@ ob_times:
   evening_end: '22:00'
   weekend_evening_start: '19:00'
   weekend_morning_end: 07:00
+berakningsar:
+  '2018':
+    sjuklon_procent: 0.80
+    vardag_kvall: 21.18
+    vardag_natt: 42.37
+    helg: 51.64
+    helg_stor: 103.23
+    vardag_jour: 31.79
+    helg_jour: 63.55
+    forsakring_procent: 0.0576
+    forsakring_procent_under25: 0.0016
+    sociala_avgifter: 0.3142
+    semester_ersattning: 0.12
+  '2019':
+    sjuklon_procent: 0.80
+    vardag_kvall: 21.60
+    vardag_natt: 43.22
+    helg: 52.67
+    helg_stor: 105.29
+    vardag_jour: 32.43
+    helg_jour: 64.82
+    forsakring_procent: 0.0576
+    forsakring_procent_under25: 0.0016
+    sociala_avgifter: 0.3142
+    semester_ersattning: 0.12
+  '2020':
+    sjuklon_procent: 0.80
+    vardag_kvall: 22.14
+    vardag_natt: 44.30
+    helg: 53.99
+    helg_stor: 107.92
+    vardag_jour: 33.24
+    helg_jour: 66.44
+    forsakring_procent: 0.0576
+    forsakring_procent_under25: 0.0016
+    sociala_avgifter: 0.3142
+    semester_ersattning: 0.12
+  '2020X':
+    sjuklon_procent: 0.80
+    vardag_kvall: 22.14
+    vardag_natt: 44.30
+    helg: 53.99
+    helg_stor: 107.92
+    vardag_jour: 33.24
+    helg_jour: 66.44
+    forsakring_procent: 0.0591
+    forsakring_procent_under25: 0.0031
+    sociala_avgifter: 0.3142
+    semester_ersattning: 0.12
+  '2021':
+    sjuklon_procent: 0.80
+    vardag_kvall: 22.54
+    vardag_natt: 45.10
+    helg: 54.96
+    helg_stor: 109.86
+    vardag_jour: 33.84
+    helg_jour: 67.64
+    forsakring_procent: 0.0591
+    forsakring_procent_under25: 0.0031
+    sociala_avgifter: 0.3142
+    semester_ersattning: 0.12
+  '2022':
+    sjuklon_procent: 0.80
+    vardag_kvall: 22.95
+    vardag_natt: 45.91
+    helg: 55.95
+    helg_stor: 111.84
+    vardag_jour: 34.45
+    helg_jour: 68.85
+    forsakring_procent: 0.0591
+    forsakring_procent_under25: 0.0031
+    sociala_avgifter: 0.3142
+    semester_ersattning: 0.12
+  '2023H2':
+    sjuklon_procent: 0.80
+    vardag_kvall: 24.06
+    vardag_natt: 48.74
+    helg: 60.11
+    helg_stor: 120.33
+    vardag_jour: 35.60
+    helg_jour: 71.30
+    forsakring_procent: 0.0591
+    forsakring_procent_under25: 0.0031
+    sociala_avgifter: 0.3142
+    semester_ersattning: 0.12
+  '2024':
+    sjuklon_procent: 0.80
+    vardag_kvall: 25.02
+    vardag_natt: 50.69
+    helg: 62.51
+    helg_stor: 125.14
+    vardag_jour: 38.55
+    helg_jour: 77.21
+    forsakring_procent: 0.0620
+    forsakring_procent_under25: 0.0031
+    sociala_avgifter: 0.3142
+    semester_ersattning: 0.12
+  '2025':
+    sjuklon_procent: 0.80
+    vardag_kvall: 25.87
+    vardag_natt: 52.41
+    helg: 64.64
+    helg_stor: 129.39
+    vardag_jour: 41.08
+    helg_jour: 82.24
+    forsakring_procent: 0.0620
+    forsakring_procent_under25: 0.0060
+    sociala_avgifter: 0.3142
+    semester_ersattning: 0.12
+  '2026':
+    sjuklon_procent: 0.80
+    vardag_kvall: 26.65
+    vardag_natt: 53.98
+    helg: 66.57
+    helg_stor: 133.27
+    vardag_jour: 42.31
+    helg_jour: 84.70
+    forsakring_procent: 0.0620
+    forsakring_procent_under25: 0.0060
+    sociala_avgifter: 0.3142
+    semester_ersattning: 0.12
 output:
   sheet_names:
     detail: Detalj

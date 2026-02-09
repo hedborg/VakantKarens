@@ -20,6 +20,7 @@ from vakant_karens_app import (
     load_config,
     load_holidays_from_yaml,
     save_holidays_to_yaml,
+    load_berakningsar_rates,
     Config,
     CONFIG_PATH,
     APP_VERSION,
@@ -37,6 +38,106 @@ def pdf_download(uploaded_file, label=None, key=None):
         mime="application/pdf",
         key=key,
     )
+
+
+def run_and_read_excel(
+    sick_pdf_data: bytes, sick_pdf_name: str,
+    payslip_files: list, sjk_pdf_data: bytes, sjk_pdf_name: str,
+    output_name: str, holidays, berakningsar_override: str = None,
+):
+    """Run calculation and read back Excel results. Returns a result dict."""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        tmpdir_path = Path(tmpdir)
+
+        sick_pdf_path = tmpdir_path / sick_pdf_name
+        with open(sick_pdf_path, "wb") as f:
+            f.write(sick_pdf_data)
+
+        payslip_paths = []
+        for name, data in payslip_files:
+            path = tmpdir_path / name
+            with open(path, "wb") as f:
+                f.write(data)
+            payslip_paths.append(str(path))
+
+        sjk_pdf_path = None
+        if sjk_pdf_data and sjk_pdf_name:
+            sjk_pdf_path = str(tmpdir_path / sjk_pdf_name)
+            with open(sjk_pdf_path, "wb") as f:
+                f.write(sjk_pdf_data)
+
+        output_path = tmpdir_path / output_name
+        config = load_config(holidays=holidays)
+
+        process_karens_calculation(
+            str(sick_pdf_path),
+            payslip_paths,
+            str(output_path),
+            config,
+            sjuklonekostnader_path=sjk_pdf_path,
+            berakningsar_override=berakningsar_override or None,
+        )
+
+        with open(output_path, "rb") as f:
+            excel_data = f.read()
+
+        df_detail = pd.read_excel(output_path, sheet_name="Detalj")
+
+        employee_sheets = {}
+        employee_timlon = {}
+        employee_metadata = {}
+        with pd.ExcelFile(output_path) as xls:
+            for sn in xls.sheet_names:
+                if sn != "Detalj":
+                    raw = pd.read_excel(xls, sheet_name=sn, header=None, nrows=10)
+                    first_cell = str(raw.iloc[0, 0]).strip() if not raw.empty else ""
+
+                    if first_cell == "Brukare":
+                        meta = {}
+                        meta["brukare"] = raw.iloc[0, 1] if len(raw) > 0 else ""
+                        meta["period"] = raw.iloc[1, 1] if len(raw) > 1 else ""
+                        meta["anställd"] = raw.iloc[2, 1] if len(raw) > 2 else ""
+                        meta["nyckel"] = raw.iloc[3, 1] if len(raw) > 3 else ""
+                        meta["berakningsar"] = raw.iloc[8, 1] if len(raw) > 8 else ""
+                        timlon_100 = raw.iloc[7, 1] if len(raw) > 7 else None
+                        if timlon_100 is not None and pd.notna(timlon_100):
+                            employee_timlon[sn] = {"rate": float(timlon_100), "multi": False}
+                        employee_metadata[sn] = meta
+                        tbl = pd.read_excel(xls, sheet_name=sn, header=None, skiprows=12)
+                        if not tbl.empty:
+                            ncols = len(tbl.columns)
+                            if ncols == 7:
+                                tbl.columns = [
+                                    "OB-klass",
+                                    "Sjk Timmar", "Sjk Kronor",
+                                    "Just Timmar", "Just Kronor",
+                                    "Netto Timmar", "Netto Kronor",
+                                ]
+                            elif ncols == 4:
+                                tbl.columns = ["OB-klass", "Enl. sjuklönekostnader", "Justering för vakanser", "Netto"]
+                            else:
+                                tbl.columns = [f"Kol{i}" for i in range(ncols)]
+                            tbl = tbl.iloc[1:]
+                            tbl = tbl.dropna(how="all").reset_index(drop=True)
+                        employee_sheets[sn] = tbl
+
+                    elif first_cell == "Timlön":
+                        rate = raw.iloc[0, 1]
+                        multi = len(raw.columns) > 2 and pd.notna(raw.iloc[0, 2])
+                        employee_timlon[sn] = {"rate": rate, "multi": multi}
+                        employee_sheets[sn] = pd.read_excel(xls, sheet_name=sn, header=3)
+
+                    else:
+                        employee_sheets[sn] = pd.read_excel(xls, sheet_name=sn)
+
+        return {
+            "excel_data": excel_data,
+            "output_name": output_name,
+            "df_detail": df_detail,
+            "employee_sheets": employee_sheets,
+            "employee_timlon": employee_timlon,
+            "employee_metadata": employee_metadata,
+        }
 
 
 def main():
@@ -168,149 +269,67 @@ def main():
                 default_output = f"Vakansrapport_{suffix}.xlsx"
 
         output_name = st.text_input(
-            "📝 Output filnamn",
+            "Output filnamn",
             value=default_output,
             help="Namnet på Excel-filen som ska genereras"
+        )
+
+        # Beräkningsår override
+        berakningsar_input = st.text_input(
+            "Beräkningsår (valfritt)",
+            value="",
+            help="Lämna tomt för att använda perioden från sjuklistan. Fyll i t.ex. '2025' för att tvinga ett annat beräkningsår.",
+            key="berakningsar_input",
         )
 
         # Process button
         st.divider()
 
-        if st.button("🚀 Beräkna Karens & OB", type="primary", use_container_width=True):
+        if st.button("Beräkna Karens & OB", type="primary", use_container_width=True):
             if not sick_pdf:
-                st.error("⚠️ Ingen sjuklista hittad! Filnamnet måste börja med 'Sjuklista'.")
+                st.error("Ingen sjuklista hittad! Filnamnet måste börja med 'Sjuklista'.")
                 return
 
             if not payslip_pdfs:
-                st.error("⚠️ Inga lönebesked hittade! Alla PDFs som inte matchar 'Sjuklista*' eller 'Sjuklönekostnader*' behandlas som lönebesked.")
+                st.error("Inga lönebesked hittade! Alla PDFs som inte matchar 'Sjuklista*' eller 'Sjuklönekostnader*' behandlas som lönebesked.")
                 return
 
-            # Create temporary directory for processing
-            with tempfile.TemporaryDirectory() as tmpdir:
-                tmpdir_path = Path(tmpdir)
+            progress_bar = st.progress(0)
+            status_text = st.empty()
 
-                # Save uploaded files
-                sick_pdf_path = tmpdir_path / sick_pdf.name
-                with open(sick_pdf_path, "wb") as f:
-                    f.write(sick_pdf.getbuffer())
+            try:
+                status_text.text("Bearbetar...")
+                progress_bar.progress(30)
 
-                payslip_paths = []
-                for pdf in payslip_pdfs:
-                    path = tmpdir_path / pdf.name
-                    with open(path, "wb") as f:
-                        f.write(pdf.getbuffer())
-                    payslip_paths.append(str(path))
+                sick_data = sick_pdf.getvalue()
+                payslip_list = [(p.name, p.getvalue()) for p in payslip_pdfs]
+                sjk_data = sjk_pdf.getvalue() if sjk_pdf else None
+                sjk_name = sjk_pdf.name if sjk_pdf else None
 
-                # Save optional Sjuklönekostnader PDF
-                sjk_pdf_path = None
-                if sjk_pdf:
-                    sjk_pdf_path = str(tmpdir_path / sjk_pdf.name)
-                    with open(sjk_pdf_path, "wb") as f:
-                        f.write(sjk_pdf.getbuffer())
+                result = run_and_read_excel(
+                    sick_data, sick_pdf.name,
+                    payslip_list, sjk_data, sjk_name,
+                    output_name, st.session_state.holidays,
+                    berakningsar_override=berakningsar_input.strip(),
+                )
 
-                output_path = tmpdir_path / output_name
+                progress_bar.progress(100)
+                status_text.text("Klar!")
 
-                # Configure
-                config = load_config(holidays=st.session_state.holidays)
+                result["sick_pdf_name"] = sick_pdf.name
+                result["sick_pdf_data"] = sick_data
+                result["payslip_files"] = payslip_list
+                result["sjk_pdf_name"] = sjk_name
+                result["sjk_pdf_data"] = sjk_data
+                result["berakningsar_used"] = berakningsar_input.strip()
 
-                # Process with progress indicators
-                progress_bar = st.progress(0)
-                status_text = st.empty()
+                st.session_state.result = result
+                st.rerun()
 
-                try:
-                    status_text.text("📖 Läser lönebesked...")
-                    progress_bar.progress(20)
-
-                    status_text.text("📋 Bearbetar sjuklista...")
-                    progress_bar.progress(40)
-
-                    status_text.text("🧮 Beräknar karens och OB...")
-                    progress_bar.progress(60)
-
-                    # Run calculation
-                    process_karens_calculation(
-                        str(sick_pdf_path),
-                        payslip_paths,
-                        str(output_path),
-                        config,
-                        sjuklonekostnader_path=sjk_pdf_path
-                    )
-
-                    status_text.text("📊 Skapar Excel-rapport...")
-                    progress_bar.progress(80)
-
-                    # Read the generated file
-                    with open(output_path, "rb") as f:
-                        excel_data = f.read()
-
-                    # Read Excel for preview
-                    df_detail = pd.read_excel(output_path, sheet_name="Detalj")
-
-                    # Read all per-employee sheets (all sheets except "Detalj")
-                    employee_sheets = {}
-                    employee_timlon = {}
-                    employee_metadata = {}
-                    with pd.ExcelFile(output_path) as xls:
-                        for sn in xls.sheet_names:
-                            if sn != "Detalj":
-                                raw = pd.read_excel(xls, sheet_name=sn, header=None, nrows=10)
-                                first_cell = str(raw.iloc[0, 0]).strip() if not raw.empty else ""
-
-                                if first_cell == "Brukare":
-                                    # New format: metadata rows 1-10, table from row 13
-                                    meta = {}
-                                    meta["brukare"] = raw.iloc[0, 1] if len(raw) > 0 else ""
-                                    meta["period"] = raw.iloc[1, 1] if len(raw) > 1 else ""
-                                    meta["anställd"] = raw.iloc[2, 1] if len(raw) > 2 else ""
-                                    meta["nyckel"] = raw.iloc[3, 1] if len(raw) > 3 else ""
-                                    timlon_80 = raw.iloc[5, 1] if len(raw) > 5 else None
-                                    timlon_100 = raw.iloc[7, 1] if len(raw) > 7 else None
-                                    if timlon_100 is not None and pd.notna(timlon_100):
-                                        employee_timlon[sn] = {"rate": float(timlon_100), "multi": False}
-                                    employee_metadata[sn] = meta
-                                    # Read table: skip 12 rows (1-12), row 13 = sub-headers
-                                    tbl = pd.read_excel(xls, sheet_name=sn, header=None, skiprows=12)
-                                    if not tbl.empty:
-                                        # First row is sub-headers ("", "Timmar", …) — use as column names
-                                        tbl.columns = ["OB-klass", "Enl. sjuklönekostnader", "Justering för vakanser", "Netto"][:len(tbl.columns)]
-                                        tbl = tbl.iloc[1:]  # skip the sub-header row itself
-                                        # Drop blank separator rows
-                                        tbl = tbl.dropna(how="all").reset_index(drop=True)
-                                    employee_sheets[sn] = tbl
-
-                                elif first_cell == "Timlön":
-                                    # Old format (backward compatibility)
-                                    rate = raw.iloc[0, 1]
-                                    multi = len(raw.columns) > 2 and pd.notna(raw.iloc[0, 2])
-                                    employee_timlon[sn] = {"rate": rate, "multi": multi}
-                                    employee_sheets[sn] = pd.read_excel(xls, sheet_name=sn, header=3)
-
-                                else:
-                                    employee_sheets[sn] = pd.read_excel(xls, sheet_name=sn)
-
-                    progress_bar.progress(100)
-                    status_text.text("✅ Klar!")
-
-                    # Store results in session state so they persist across reruns
-                    st.session_state.result = {
-                        "excel_data": excel_data,
-                        "output_name": output_name,
-                        "df_detail": df_detail,
-                        "employee_sheets": employee_sheets,
-                        "employee_timlon": employee_timlon,
-                        "employee_metadata": employee_metadata,
-                        "sick_pdf_name": sick_pdf.name,
-                        "sick_pdf_data": sick_pdf.getvalue(),
-                        "payslip_files": [(p.name, p.getvalue()) for p in payslip_pdfs],
-                        "sjk_pdf_name": sjk_pdf.name if sjk_pdf else None,
-                        "sjk_pdf_data": sjk_pdf.getvalue() if sjk_pdf else None,
-                    }
-                    st.rerun()
-
-                except Exception as e:
-                    st.error(f"❌ Ett fel uppstod: {str(e)}")
-                    if debug_mode:
-                        st.exception(e)
+            except Exception as e:
+                st.error(f"Ett fel uppstod: {str(e)}")
+                if debug_mode:
+                    st.exception(e)
 
     # Show results if available
     if st.session_state.result is not None:
@@ -320,7 +339,44 @@ def main():
         employee_timlon = res.get("employee_timlon", {})
         employee_metadata = res.get("employee_metadata", {})
 
-        st.success("🎉 Beräkning genomförd!")
+        st.success("Beräkning genomförd!")
+
+        # Show current beräkningsår and recalculate option
+        current_year = res.get("berakningsar_used", "")
+        # Try to get the actual year used from employee metadata
+        if not current_year:
+            for meta in employee_metadata.values():
+                yr = meta.get("berakningsar", "")
+                if yr and pd.notna(yr):
+                    current_year = str(int(yr)) if isinstance(yr, float) else str(yr)
+                    break
+
+        with st.expander(f"Beräkningsår: {current_year or '(okänt)'} — Ändra?", expanded=False):
+            new_year = st.text_input(
+                "Nytt beräkningsår",
+                value=current_year,
+                key="recalc_year",
+                help="Ange beräkningsår (t.ex. 2025) och klicka Beräkna om",
+            )
+            if st.button("Beräkna om", type="primary", key="recalc_btn"):
+                try:
+                    recalc_result = run_and_read_excel(
+                        res["sick_pdf_data"], res["sick_pdf_name"],
+                        res["payslip_files"],
+                        res.get("sjk_pdf_data"), res.get("sjk_pdf_name"),
+                        res["output_name"], st.session_state.holidays,
+                        berakningsar_override=new_year.strip(),
+                    )
+                    recalc_result["sick_pdf_name"] = res["sick_pdf_name"]
+                    recalc_result["sick_pdf_data"] = res["sick_pdf_data"]
+                    recalc_result["payslip_files"] = res["payslip_files"]
+                    recalc_result["sjk_pdf_name"] = res.get("sjk_pdf_name")
+                    recalc_result["sjk_pdf_data"] = res.get("sjk_pdf_data")
+                    recalc_result["berakningsar_used"] = new_year.strip()
+                    st.session_state.result = recalc_result
+                    st.rerun()
+                except Exception as e:
+                    st.error(f"Fel vid omberäkning: {str(e)}")
 
         # Show uploaded files with download buttons
         with st.expander("📁 Uppladdade filer", expanded=False):
