@@ -86,49 +86,69 @@ def run_and_read_excel(
         employee_sheets = {}
         employee_timlon = {}
         employee_metadata = {}
+        validation_rows = []  # [(anställd, vår summa, pdf summa, status)]
         with pd.ExcelFile(output_path) as xls:
             for sn in xls.sheet_names:
-                if sn != "Detalj":
-                    raw = pd.read_excel(xls, sheet_name=sn, header=None, nrows=10)
-                    first_cell = str(raw.iloc[0, 0]).strip() if not raw.empty else ""
+                if sn in ("Detalj", "Vakanssammanfattning"):
+                    continue
+                raw = pd.read_excel(xls, sheet_name=sn, header=None, nrows=10)
+                first_cell = str(raw.iloc[0, 0]).strip() if not raw.empty else ""
 
-                    if first_cell == "Brukare":
-                        meta = {}
-                        meta["brukare"] = raw.iloc[0, 1] if len(raw) > 0 else ""
-                        meta["period"] = raw.iloc[1, 1] if len(raw) > 1 else ""
-                        meta["anställd"] = raw.iloc[2, 1] if len(raw) > 2 else ""
-                        meta["nyckel"] = raw.iloc[3, 1] if len(raw) > 3 else ""
-                        meta["berakningsar"] = raw.iloc[8, 1] if len(raw) > 8 else ""
-                        timlon_100 = raw.iloc[7, 1] if len(raw) > 7 else None
-                        if timlon_100 is not None and pd.notna(timlon_100):
-                            employee_timlon[sn] = {"rate": float(timlon_100), "multi": False}
-                        employee_metadata[sn] = meta
-                        tbl = pd.read_excel(xls, sheet_name=sn, header=None, skiprows=12)
-                        if not tbl.empty:
-                            ncols = len(tbl.columns)
-                            if ncols == 7:
-                                tbl.columns = [
-                                    "OB-klass",
-                                    "Sjk Timmar", "Sjk Kronor",
-                                    "Just Timmar", "Just Kronor",
-                                    "Netto Timmar", "Netto Kronor",
-                                ]
-                            elif ncols == 4:
-                                tbl.columns = ["OB-klass", "Enl. sjuklönekostnader", "Justering för vakanser", "Netto"]
-                            else:
-                                tbl.columns = [f"Kol{i}" for i in range(ncols)]
-                            tbl = tbl.iloc[1:]
-                            tbl = tbl.dropna(how="all").reset_index(drop=True)
-                        employee_sheets[sn] = tbl
+                if first_cell == "Brukare":
+                    meta = {}
+                    meta["brukare"] = raw.iloc[0, 1] if len(raw) > 0 else ""
+                    meta["period"] = raw.iloc[1, 1] if len(raw) > 1 else ""
+                    meta["anställd"] = raw.iloc[2, 1] if len(raw) > 2 else ""
+                    meta["nyckel"] = raw.iloc[3, 1] if len(raw) > 3 else ""
+                    meta["berakningsar"] = raw.iloc[8, 1] if len(raw) > 8 else ""
+                    timlon_100 = raw.iloc[7, 1] if len(raw) > 7 else None
+                    if timlon_100 is not None and pd.notna(timlon_100):
+                        employee_timlon[sn] = {"rate": float(timlon_100), "multi": False}
+                    employee_metadata[sn] = meta
+                    tbl = pd.read_excel(xls, sheet_name=sn, header=None, skiprows=12)
+                    if not tbl.empty:
+                        ncols = len(tbl.columns)
+                        if ncols == 7:
+                            tbl.columns = [
+                                "OB-klass",
+                                "Sjk Timmar", "Sjk Kronor",
+                                "Just Timmar", "Just Kronor",
+                                "Netto Timmar", "Netto Kronor",
+                            ]
+                        elif ncols == 4:
+                            tbl.columns = ["OB-klass", "Enl. sjuklönekostnader", "Justering för vakanser", "Netto"]
+                        else:
+                            tbl.columns = [f"Kol{i}" for i in range(ncols)]
+                        tbl = tbl.iloc[1:]
+                        tbl = tbl.dropna(how="all").reset_index(drop=True)
 
-                    elif first_cell == "Timlön":
-                        rate = raw.iloc[0, 1]
-                        multi = len(raw.columns) > 2 and pd.notna(raw.iloc[0, 2])
-                        employee_timlon[sn] = {"rate": rate, "multi": multi}
-                        employee_sheets[sn] = pd.read_excel(xls, sheet_name=sn, header=3)
+                        # Extract validation row if present
+                        kontroll = tbl[tbl["OB-klass"] == "Kontroll mot Sjuklönekostnader"]
+                        if not kontroll.empty:
+                            row = kontroll.iloc[0]
+                            our_val = row.get("Sjk Timmar", row.iloc[1]) if ncols == 7 else None
+                            pdf_val = row.get("Sjk Kronor", row.iloc[2]) if ncols == 7 else None
+                            flag = row.get("Just Timmar", row.iloc[3]) if ncols == 7 else None
+                            if our_val is not None and pdf_val is not None:
+                                validation_rows.append({
+                                    "Anställd": sn,
+                                    "Vår Summa (kr)": int(our_val) if pd.notna(our_val) else "",
+                                    "PDF Summa (kr)": int(pdf_val) if pd.notna(pdf_val) else "",
+                                    "Status": str(flag) if pd.notna(flag) else "",
+                                })
+                            # Remove validation row from displayed table
+                            tbl = tbl[tbl["OB-klass"] != "Kontroll mot Sjuklönekostnader"].reset_index(drop=True)
 
-                    else:
-                        employee_sheets[sn] = pd.read_excel(xls, sheet_name=sn)
+                    employee_sheets[sn] = tbl
+
+                elif first_cell == "Timlön":
+                    rate = raw.iloc[0, 1]
+                    multi = len(raw.columns) > 2 and pd.notna(raw.iloc[0, 2])
+                    employee_timlon[sn] = {"rate": rate, "multi": multi}
+                    employee_sheets[sn] = pd.read_excel(xls, sheet_name=sn, header=3)
+
+                else:
+                    employee_sheets[sn] = pd.read_excel(xls, sheet_name=sn)
 
         return {
             "excel_data": excel_data,
@@ -137,6 +157,7 @@ def run_and_read_excel(
             "employee_sheets": employee_sheets,
             "employee_timlon": employee_timlon,
             "employee_metadata": employee_metadata,
+            "validation_rows": validation_rows,
         }
 
 
@@ -431,6 +452,18 @@ def main():
         col2.metric("Sjuklön-timmar", f"{paid_hours:.1f}h")
         col3.metric("Karens-timmar", f"{karens_hours:.1f}h")
         col4.metric(">14-timmar", f"{gt14_hours:.1f}h")
+
+        # Validation table: compare our totals vs PDF Summa
+        validation_rows = res.get("validation_rows", [])
+        if validation_rows:
+            st.markdown("### Kontroll mot Sjuklönekostnader")
+            df_val = pd.DataFrame(validation_rows)
+            all_ok = all(r["Status"] == "OK" for r in validation_rows)
+            if all_ok:
+                st.success("✅ Alla belopp stämmer överens med Sjuklönekostnader-PDF:en")
+            else:
+                st.warning("⚠️ Vissa belopp avviker — kontrollera nedan")
+            st.dataframe(df_val, use_container_width=True, hide_index=True)
 
         # Show detail table
         st.markdown("### Detaljerad uppdelning")

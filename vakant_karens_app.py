@@ -663,7 +663,10 @@ class SjuklonekostnaderParser:
             return "Dag", False
         return None, False
 
-    def parse(self, pdf_path: str) -> Tuple[Dict, Dict, Dict, Dict, Dict]:
+    # Pattern for "Summa <amount>" (NOT "Summa att betala")
+    SUMMA_PATTERN = re.compile(r"^Summa\s+([\d\s]+[,\.]\d+)\s*$")
+
+    def parse(self, pdf_path: str) -> Tuple[Dict, Dict, Dict, Dict, Dict, Dict]:
         """
         Parse a Sjuklönekostnader PDF.
 
@@ -673,39 +676,68 @@ class SjuklonekostnaderParser:
             total_hours_by_ob: pnr -> {ob_class: hours} (paid sjuklön only)
             karens_hours_by_pnr: pnr -> total karens hours
             base_hours_by_pnr: pnr -> total base paid hours (excl. supplements)
+            summa_by_pnr: pnr -> total "Summa" amount from PDF (per employee)
         """
         karens_seconds: Dict[Tuple[str, str], float] = {}
         sick_day_ranges: Dict[str, List[Tuple[date, date]]] = {}
         total_hours_by_ob: Dict[str, Dict[str, float]] = {}
         karens_hours_by_pnr: Dict[str, float] = {}
         base_hours_by_pnr: Dict[str, float] = {}
+        summa_by_pnr: Dict[str, float] = {}
 
         if not os.path.exists(pdf_path):
             logger.warning(f"Sjuklönekostnader file not found: {pdf_path}")
-            return karens_seconds, sick_day_ranges, total_hours_by_ob, karens_hours_by_pnr, base_hours_by_pnr
+            return karens_seconds, sick_day_ranges, total_hours_by_ob, karens_hours_by_pnr, base_hours_by_pnr, summa_by_pnr
 
         try:
             with pdfplumber.open(pdf_path) as pdf:
                 text = "\n".join((p.extract_text() or "") for p in pdf.pages)
         except Exception as e:
             logger.error(f"Error reading Sjuklönekostnader PDF: {e}")
-            return karens_seconds, sick_day_ranges, total_hours_by_ob, karens_hours_by_pnr, base_hours_by_pnr
+            return karens_seconds, sick_day_ranges, total_hours_by_ob, karens_hours_by_pnr, base_hours_by_pnr, summa_by_pnr
 
         current_pnr = None
+        brukare_pnr = None  # The brukare PNR from the page header (skip on continuation pages)
+        expect_brukare_pnr = False  # Next PNR line is the brukare, not an employee
         karens_count = 0
         sick_range_count = 0
 
         for line in text.splitlines():
+            # Detect brukare header line (marks next PNR as the brukare, not an employee)
+            line_stripped = line.strip().lower()
+            if line_stripped.startswith("brukare"):
+                expect_brukare_pnr = True
+                continue
+
             # Check for personnummer line
             m_pnr = self.PNR_PATTERN.search(line)
             if m_pnr:
                 pnr_candidate = m_pnr.group(1) + m_pnr.group(2)
                 if not re.match(r"^\s*\d{4}-\d{2}-\d{2}", line):
+                    if expect_brukare_pnr:
+                        # This is the brukare PNR from the header — skip it
+                        brukare_pnr = pnr_candidate
+                        expect_brukare_pnr = False
+                        logger.debug(f"  Sjuklönekostnader: brukare PNR {brukare_pnr} (skipped)")
+                        continue
+                    if pnr_candidate == brukare_pnr:
+                        # Brukare PNR reappearing on a continuation page — skip
+                        logger.debug(f"  Sjuklönekostnader: brukare PNR {pnr_candidate} (continuation, skipped)")
+                        continue
                     current_pnr = pnr_candidate
                     logger.debug(f"  Sjuklönekostnader: person {current_pnr}")
                     continue
 
             if not current_pnr:
+                continue
+
+            # Check for per-employee "Summa" line (NOT "Summa att betala")
+            m_summa = self.SUMMA_PATTERN.match(line.strip())
+            if m_summa:
+                amount_str = m_summa.group(1).replace(" ", "")
+                amount = PersonnummerParser.parse_float_sv(amount_str)
+                summa_by_pnr[current_pnr] = amount
+                logger.debug(f"    Summa for {current_pnr}: {amount}")
                 continue
 
             line_lower = line.lower()
@@ -781,7 +813,7 @@ class SjuklonekostnaderParser:
             f"{sick_range_count} sick day ranges, "
             f"{len(total_hours_by_ob)} persons with OB hour data"
         )
-        return karens_seconds, sick_day_ranges, total_hours_by_ob, karens_hours_by_pnr, base_hours_by_pnr
+        return karens_seconds, sick_day_ranges, total_hours_by_ob, karens_hours_by_pnr, base_hours_by_pnr, summa_by_pnr
 
 
 class KarensCalculator:
@@ -1422,6 +1454,7 @@ class ReportGenerator:
         file_code: str = "",
         rates: Optional[Dict] = None,
         berakningsar: str = "",
+        sjk_summa_by_pnr: Optional[Dict[str, float]] = None,
     ):
         """Save detailed report + per-employee sheets to Excel"""
         if sjk_total_hours is None:
@@ -1432,6 +1465,8 @@ class ReportGenerator:
             sjk_base_hours = {}
         if timlon_map is None:
             timlon_map = {}
+        if sjk_summa_by_pnr is None:
+            sjk_summa_by_pnr = {}
 
         # Parse file_code into brukare / period
         parts = file_code.split("_", 1)
@@ -1629,6 +1664,21 @@ class ReportGenerator:
                         write_row(item, row_num)
                         row_num += 1
 
+                # Validation: compare our Sjk Kronor total vs PDF "Summa"
+                pdf_summa = sjk_summa_by_pnr.get(pnr)
+                if pdf_summa is not None and summa_row is not None:
+                    row_num += 1
+                    our_total = round(summa_row["sjk_kronor"])
+                    pdf_total = round(pdf_summa)
+                    if our_total == pdf_total:
+                        flag = "OK"
+                    else:
+                        flag = f"DIFF ({our_total} vs {pdf_total})"
+                    ws.cell(row=row_num, column=1, value="Kontroll mot Sjuklönekostnader")
+                    ws.cell(row=row_num, column=2, value=our_total)
+                    ws.cell(row=row_num, column=3, value=pdf_total)
+                    ws.cell(row=row_num, column=4, value=flag)
+
                 # Set employee sheet column widths
                 for col_letter in ["A", "B", "C", "D", "E", "F", "G"]:
                     ws.column_dimensions[col_letter].width = 25
@@ -1674,9 +1724,10 @@ def process_karens_calculation(
     sjk_total_hours = {}
     sjk_karens_hours = {}
     sjk_base_hours = {}
+    sjk_summa_by_pnr = {}
     if sjuklonekostnader_path:
         sjk_parser = SjuklonekostnaderParser(config)
-        sjk_karens, sjk_sick_ranges, sjk_total_hours, sjk_karens_hours, sjk_base_hours = sjk_parser.parse(sjuklonekostnader_path)
+        sjk_karens, sjk_sick_ranges, sjk_total_hours, sjk_karens_hours, sjk_base_hours, sjk_summa_by_pnr = sjk_parser.parse(sjuklonekostnader_path)
 
         # Merge: payslip data takes priority, sjuklönekostnader fills gaps
         for key, val in sjk_karens.items():
@@ -1732,6 +1783,7 @@ def process_karens_calculation(
         file_code=file_code,
         rates=rates,
         berakningsar=berakningsar,
+        sjk_summa_by_pnr=sjk_summa_by_pnr,
     )
 
 
