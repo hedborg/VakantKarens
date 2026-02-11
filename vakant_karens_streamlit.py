@@ -369,7 +369,7 @@ def main():
             for meta in employee_metadata.values():
                 yr = meta.get("berakningsar", "")
                 if yr and pd.notna(yr):
-                    current_year = str(int(yr)) if isinstance(yr, float) else str(yr)
+                    current_year = str(int(yr)) if isinstance(yr, (int, float)) and yr == int(yr) else str(yr)
                     break
 
         with st.expander(f"Beräkningsår: {current_year or '(okänt)'} — Ändra?", expanded=False):

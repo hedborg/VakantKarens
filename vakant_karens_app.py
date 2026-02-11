@@ -1569,7 +1569,7 @@ class ReportGenerator:
                 ws["B8"] = timlon_rate if timlon_rate else ""
 
                 ws["A9"] = "Beräkningsår"
-                ws["B9"] = int(year) if year else ""
+                ws["B9"] = year if year else ""
 
                 ws["A10"] = "Beräknare"
                 ws["B10"] = "APP"
