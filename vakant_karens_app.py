@@ -1622,10 +1622,13 @@ class ReportGenerator:
                             under_23 = True
                             under_23_str = "ja"
 
-                        # Pensioner: pension_age+ at start of beräkningsår (Jan 1)
+                        # Pensioner: pension_age+ at start of report year
+                        # Always use the report period year (p_year), not the
+                        # beräkningsår key — the beräkningsår may differ from
+                        # the actual period (e.g. "2023H2" rates used for a
+                        # 2025 period) and non-4-digit keys would break.
                         pension_age = rates.get("pension_age", 67) if rates else 67
-                        ber_year = int(year) if year and year.isdigit() else p_year
-                        age_at_year_start = ber_year - birth.year
+                        age_at_year_start = p_year - birth.year
                         if age_at_year_start >= pension_age:
                             is_pensioner = True
                             pensionar_str = "ja"

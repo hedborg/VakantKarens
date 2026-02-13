@@ -215,6 +215,20 @@ berakningsar:
     sociala_avgifter_pens: 0.1021
     pension_age: 66
     semester_ersattning: 0.12
+  '202406':
+    sjuklon_procent: 0.80
+    vardag_kvall: 24.06
+    vardag_natt: 48.74
+    helg: 60.11
+    helg_stor: 120.33
+    vardag_jour: 35.60
+    helg_jour: 71.30
+    forsakring_procent: 0.0620
+    forsakring_procent_under25: 0.0031
+    sociala_avgifter: 0.3142
+    sociala_avgifter_pens: 0.1021
+    pension_age: 66
+    semester_ersattning: 0.12
   '2025':
     sjuklon_procent: 0.80
     vardag_kvall: 25.87
