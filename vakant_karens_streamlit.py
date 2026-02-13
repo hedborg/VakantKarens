@@ -91,7 +91,7 @@ def run_and_read_excel(
             for sn in xls.sheet_names:
                 if sn in ("Detalj", "Vakanssammanfattning"):
                     continue
-                raw = pd.read_excel(xls, sheet_name=sn, header=None, nrows=10)
+                raw = pd.read_excel(xls, sheet_name=sn, header=None, nrows=11)
                 first_cell = str(raw.iloc[0, 0]).strip() if not raw.empty else ""
 
                 if first_cell == "Brukare":
@@ -100,12 +100,12 @@ def run_and_read_excel(
                     meta["period"] = raw.iloc[1, 1] if len(raw) > 1 else ""
                     meta["anställd"] = raw.iloc[2, 1] if len(raw) > 2 else ""
                     meta["nyckel"] = raw.iloc[3, 1] if len(raw) > 3 else ""
-                    meta["berakningsar"] = raw.iloc[8, 1] if len(raw) > 8 else ""
-                    timlon_100 = raw.iloc[7, 1] if len(raw) > 7 else None
+                    meta["berakningsar"] = raw.iloc[9, 1] if len(raw) > 9 else ""
+                    timlon_100 = raw.iloc[8, 1] if len(raw) > 8 else None
                     if timlon_100 is not None and pd.notna(timlon_100):
                         employee_timlon[sn] = {"rate": float(timlon_100), "multi": False}
                     employee_metadata[sn] = meta
-                    tbl = pd.read_excel(xls, sheet_name=sn, header=None, skiprows=12)
+                    tbl = pd.read_excel(xls, sheet_name=sn, header=None, skiprows=13)
                     if not tbl.empty:
                         ncols = len(tbl.columns)
                         if ncols == 7:

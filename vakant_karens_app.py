@@ -1174,6 +1174,7 @@ class ReportGenerator:
         timlon_rate: Optional[float] = None,
         rates: Optional[Dict] = None,
         under_23: bool = False,
+        is_pensioner: bool = False,
     ) -> List[Dict]:
         """
         Build data for the per-employee sheet.
@@ -1395,8 +1396,13 @@ class ReportGenerator:
             "netto_kronor": round(sjuklon_netto * forsakring_pct, 2),
         })
 
-        # "Sociala avgifter"
-        soc_avg_pct = rates.get("sociala_avgifter", 0.3142) if rates else 0.3142
+        # "Sociala avgifter" (reduced rate for pensioners 67+)
+        if rates and is_pensioner:
+            soc_avg_pct = rates.get("sociala_avgifter_pens", 0.1021)
+        elif rates:
+            soc_avg_pct = rates.get("sociala_avgifter", 0.3142)
+        else:
+            soc_avg_pct = 0.3142
         rows.append({
             "ob_class": "_soc_avg",
             "display_name": "Sociala avgifter",
@@ -1499,9 +1505,11 @@ class ReportGenerator:
                 emp_karens_hrs = sjk_karens_hours.get(pnr, 0.0)
                 emp_base_hrs = sjk_base_hours.get(pnr, 0.0)
 
-                # Determine under_23 status
+                # Determine under_23 and pensioner status from personnummer
                 under_23 = False
                 under_23_str = "nej"
+                is_pensioner = False
+                pensionar_str = "nej"
                 if len(pnr) >= 8 and period:
                     try:
                         birth = date(int(pnr[:4]), int(pnr[4:6]), int(pnr[6:8]))
@@ -1518,12 +1526,20 @@ class ReportGenerator:
                         if birthday_23 > end_of_month:
                             under_23 = True
                             under_23_str = "ja"
+
+                        # Pensioner: 67+ at start of beräkningsår (Jan 1)
+                        ber_year = int(year) if year and year.isdigit() else p_year
+                        age_at_year_start = ber_year - birth.year
+                        if age_at_year_start >= 67:
+                            is_pensioner = True
+                            pensionar_str = "ja"
                     except (ValueError, IndexError):
                         pass
 
                 sheet_data = ReportGenerator.create_employee_sheet_data(
                     emp, sjk_hrs, emp_karens_hrs, emp_base_hrs,
                     timlon_rate=timlon_rate, rates=rates, under_23=under_23,
+                    is_pensioner=is_pensioner,
                 )
 
                 # Capture justering total for summary sheet (vacancy cost)
@@ -1545,7 +1561,7 @@ class ReportGenerator:
 
                 sjklon_procent = rates.get("sjuklon_procent", 0.80) if rates else 0.80
 
-                # ── Metadata (rows 1-10) ──
+                # ── Metadata (rows 1-11) ──
                 ws["A1"] = "Brukare"
                 ws["B1"] = brukare
 
@@ -1561,42 +1577,45 @@ class ReportGenerator:
                 ws["A5"] = "Under 23"
                 ws["B5"] = under_23_str
 
-                ws["A6"] = "Timlön (80%)"
-                ws["B6"] = round(timlon_rate * sjklon_procent, 2) if timlon_rate else ""
+                ws["A6"] = "Pensionär (67+)"
+                ws["B6"] = pensionar_str
 
-                ws["A7"] = "Sjuklönprocent"
+                ws["A7"] = "Timlön (80%)"
+                ws["B7"] = round(timlon_rate * sjklon_procent, 2) if timlon_rate else ""
+
+                ws["A8"] = "Sjuklönprocent"
                 if timlon_rate:
-                    ws["B7"] = sjklon_procent
-                    ws["B7"].number_format = '0.00%'
+                    ws["B8"] = sjklon_procent
+                    ws["B8"].number_format = '0.00%'
 
-                ws["A8"] = "Timlön (100%)"
-                ws["B8"] = timlon_rate if timlon_rate else ""
+                ws["A9"] = "Timlön (100%)"
+                ws["B9"] = timlon_rate if timlon_rate else ""
 
-                ws["A9"] = "Beräkningsår"
-                ws["B9"] = year if year else ""
+                ws["A10"] = "Beräkningsår"
+                ws["B10"] = year if year else ""
 
-                ws["A10"] = "Beräknare"
-                ws["B10"] = "APP"
+                ws["A11"] = "Beräknare"
+                ws["B11"] = "APP"
 
-                # ── Table (rows 11+) ──
+                # ── Table (rows 12+) ──
                 # Column layout: A=label, B=sjk_timmar, C=sjk_kronor,
                 #   D=just_timmar, E=just_kronor, F=netto_timmar, G=netto_kronor
 
-                # Group headers (row 11)
-                ws.cell(row=11, column=2, value="Enligt sjuklönekostnader")
-                ws.cell(row=11, column=4, value="Justering för vakanser")
-                ws.cell(row=11, column=6, value="Netto")
+                # Group headers (row 12)
+                ws.cell(row=12, column=2, value="Enligt sjuklönekostnader")
+                ws.cell(row=12, column=4, value="Justering för vakanser")
+                ws.cell(row=12, column=6, value="Netto")
 
-                # Sub-headers (row 13)
-                ws.cell(row=13, column=2, value="Timmar")
-                ws.cell(row=13, column=3, value="Kronor")
-                ws.cell(row=13, column=4, value="Timmar")
-                ws.cell(row=13, column=5, value="Kronor")
-                ws.cell(row=13, column=6, value="Timmar")
-                ws.cell(row=13, column=7, value="Kronor")
+                # Sub-headers (row 14)
+                ws.cell(row=14, column=2, value="Timmar")
+                ws.cell(row=14, column=3, value="Kronor")
+                ws.cell(row=14, column=4, value="Timmar")
+                ws.cell(row=14, column=5, value="Kronor")
+                ws.cell(row=14, column=6, value="Timmar")
+                ws.cell(row=14, column=7, value="Kronor")
 
                 # ── Write data rows ──
-                row_num = 14
+                row_num = 15
 
                 # Helper to write one data row
                 def write_row(item, rn):

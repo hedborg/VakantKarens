@@ -125,6 +125,7 @@ berakningsar:
     forsakring_procent: 0.0576
     forsakring_procent_under25: 0.0016
     sociala_avgifter: 0.3142
+    sociala_avgifter_pens: 0.1021
     semester_ersattning: 0.12
   '2019':
     sjuklon_procent: 0.80
@@ -137,6 +138,7 @@ berakningsar:
     forsakring_procent: 0.0576
     forsakring_procent_under25: 0.0016
     sociala_avgifter: 0.3142
+    sociala_avgifter_pens: 0.1021
     semester_ersattning: 0.12
   '2020':
     sjuklon_procent: 0.80
@@ -149,6 +151,7 @@ berakningsar:
     forsakring_procent: 0.0576
     forsakring_procent_under25: 0.0016
     sociala_avgifter: 0.3142
+    sociala_avgifter_pens: 0.1021
     semester_ersattning: 0.12
   '2020X':
     sjuklon_procent: 0.80
@@ -161,6 +164,7 @@ berakningsar:
     forsakring_procent: 0.0591
     forsakring_procent_under25: 0.0031
     sociala_avgifter: 0.3142
+    sociala_avgifter_pens: 0.1021
     semester_ersattning: 0.12
   '2021':
     sjuklon_procent: 0.80
@@ -173,6 +177,7 @@ berakningsar:
     forsakring_procent: 0.0591
     forsakring_procent_under25: 0.0031
     sociala_avgifter: 0.3142
+    sociala_avgifter_pens: 0.1021
     semester_ersattning: 0.12
   '2022':
     sjuklon_procent: 0.80
@@ -185,6 +190,7 @@ berakningsar:
     forsakring_procent: 0.0591
     forsakring_procent_under25: 0.0031
     sociala_avgifter: 0.3142
+    sociala_avgifter_pens: 0.1021
     semester_ersattning: 0.12
   '2023H2':
     sjuklon_procent: 0.80
@@ -197,6 +203,7 @@ berakningsar:
     forsakring_procent: 0.0591
     forsakring_procent_under25: 0.0031
     sociala_avgifter: 0.3142
+    sociala_avgifter_pens: 0.1021
     semester_ersattning: 0.12
   '2024':
     sjuklon_procent: 0.80
@@ -209,6 +216,7 @@ berakningsar:
     forsakring_procent: 0.0620
     forsakring_procent_under25: 0.0031
     sociala_avgifter: 0.3142
+    sociala_avgifter_pens: 0.1021
     semester_ersattning: 0.12
   '2025':
     sjuklon_procent: 0.80
@@ -221,6 +229,7 @@ berakningsar:
     forsakring_procent: 0.0620
     forsakring_procent_under25: 0.0060
     sociala_avgifter: 0.3142
+    sociala_avgifter_pens: 0.1021
     semester_ersattning: 0.12
   '2026':
     sjuklon_procent: 0.80
@@ -233,6 +242,7 @@ berakningsar:
     forsakring_procent: 0.0620
     forsakring_procent_under25: 0.0060
     sociala_avgifter: 0.3142
+    sociala_avgifter_pens: 0.1021
     semester_ersattning: 0.12
 output:
   sheet_names:
