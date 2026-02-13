@@ -508,12 +508,16 @@ class SickListParser:
         sick_hrs = PersonnummerParser.parse_float_sv(m0.group(4))
         rest = m0.group(5)
 
-        # Extract personnummer from Sjukskriven side
+        # Extract personnummer or anställningsnr from Sjukskriven side
+        # Try full personnummer first (10-12 digits), then short anställningsnr (3+ digits)
         mp = re.search(r"(\d{10,12})", rest)
         if not mp:
-            return None
+            mp = re.search(r"(\d{3,9})", rest)
+            if not mp:
+                return None
 
-        sick_pnr = PersonnummerParser.normalize(mp.group(1))
+        raw_id = mp.group(1)
+        sick_pnr = PersonnummerParser.normalize(raw_id) if len(raw_id) >= 10 else raw_id
         sick_name = rest[:mp.start()].strip()
         sick_name = re.sub(r"\s{2,}", " ", sick_name).strip()
 
@@ -1739,11 +1743,20 @@ def process_karens_calculation(
     # Parse sick list
     sicklist_parser = SickListParser(config)
     sick_df = sicklist_parser.parse_sick_rows(sick_pdf)
-    
+
     if sick_df.empty:
-        logger.warning("No sick list entries found")
-        return
-    
+        raise ValueError("Inga sjuklistrader hittades i PDF:en.")
+
+    # Resolve anställningsnr to personnummer in sick list
+    # anst_map is pnr -> anst_nr, build reverse: anst_nr -> pnr
+    anst_to_pnr = {str(v): k for k, v in anst_map.items()}
+    def resolve_pnr(val):
+        val = str(val)
+        if len(val) >= 10:
+            return val
+        return anst_to_pnr.get(val, val)
+    sick_df["Personnummer"] = sick_df["Personnummer"].apply(resolve_pnr)
+
     # Calculate segments
     calculator = KarensCalculator(config)
     detail = calculator.calculate_segments(
@@ -1751,8 +1764,7 @@ def process_karens_calculation(
     )
     
     if detail.empty:
-        logger.warning("No vacant segments found")
-        return
+        raise ValueError("Inga vakanta segment hittades efter beräkning.")
     
     # Post-process
     detail = ReportGenerator.merge_adjacent_segments(detail)
