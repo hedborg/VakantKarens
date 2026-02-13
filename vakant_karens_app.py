@@ -670,7 +670,16 @@ class SjuklonekostnaderParser:
     # Pattern for "Summa <amount>" (NOT "Summa att betala")
     SUMMA_PATTERN = re.compile(r"^Summa\s+([\d\s]+[,\.]\d+)\s*$")
 
-    def parse(self, pdf_path: str) -> Tuple[Dict, Dict, Dict, Dict, Dict, Dict]:
+    # Pattern for semesterersättning lines with monetary amount:
+    #   "Semesterersättning sjuklön 2025-04-02 - 2025-04-30 2 405,70"
+    #   "Semesterersättning Sjuklön 2025-04-08 49,04"
+    # The amount follows a date (YYYY-MM-DD) separated by spaces.
+    # We match: date, then 1+ spaces, then the amount at end-of-line.
+    SEM_ERS_AMOUNT_PATTERN = re.compile(
+        r"\d{4}-\d{2}-\d{2}\s+([\d\s]+[,\.]\d+)\s*$"
+    )
+
+    def parse(self, pdf_path: str) -> Tuple[Dict, Dict, Dict, Dict, Dict, Dict, Dict]:
         """
         Parse a Sjuklönekostnader PDF.
 
@@ -681,6 +690,7 @@ class SjuklonekostnaderParser:
             karens_hours_by_pnr: pnr -> total karens hours
             base_hours_by_pnr: pnr -> total base paid hours (excl. supplements)
             summa_by_pnr: pnr -> total "Summa" amount from PDF (per employee)
+            sem_ers_by_pnr: pnr -> total semesterersättning kr
         """
         karens_seconds: Dict[Tuple[str, str], float] = {}
         sick_day_ranges: Dict[str, List[Tuple[date, date]]] = {}
@@ -688,17 +698,18 @@ class SjuklonekostnaderParser:
         karens_hours_by_pnr: Dict[str, float] = {}
         base_hours_by_pnr: Dict[str, float] = {}
         summa_by_pnr: Dict[str, float] = {}
+        sem_ers_by_pnr: Dict[str, float] = {}
 
         if not os.path.exists(pdf_path):
             logger.warning(f"Sjuklönekostnader file not found: {pdf_path}")
-            return karens_seconds, sick_day_ranges, total_hours_by_ob, karens_hours_by_pnr, base_hours_by_pnr, summa_by_pnr
+            return karens_seconds, sick_day_ranges, total_hours_by_ob, karens_hours_by_pnr, base_hours_by_pnr, summa_by_pnr, sem_ers_by_pnr
 
         try:
             with pdfplumber.open(pdf_path) as pdf:
                 text = "\n".join((p.extract_text() or "") for p in pdf.pages)
         except Exception as e:
             logger.error(f"Error reading Sjuklönekostnader PDF: {e}")
-            return karens_seconds, sick_day_ranges, total_hours_by_ob, karens_hours_by_pnr, base_hours_by_pnr, summa_by_pnr
+            return karens_seconds, sick_day_ranges, total_hours_by_ob, karens_hours_by_pnr, base_hours_by_pnr, summa_by_pnr, sem_ers_by_pnr
 
         current_pnr = None
         brukare_pnr = None  # The brukare PNR from the page header (skip on continuation pages)
@@ -746,8 +757,12 @@ class SjuklonekostnaderParser:
 
             line_lower = line.lower()
 
-            # Skip semesterersättning lines — these contain monetary amounts, not hours
+            # Semesterersättning lines — extract monetary amount per person
             if "semesterersättning" in line_lower:
+                m_sem = self.SEM_ERS_AMOUNT_PATTERN.search(line)
+                if m_sem and current_pnr:
+                    sem_kr = PersonnummerParser.parse_float_sv(m_sem.group(1).replace(" ", ""))
+                    sem_ers_by_pnr[current_pnr] = sem_ers_by_pnr.get(current_pnr, 0.0) + sem_kr
                 continue
 
             # Try date range pattern first, then single date
@@ -817,7 +832,7 @@ class SjuklonekostnaderParser:
             f"{sick_range_count} sick day ranges, "
             f"{len(total_hours_by_ob)} persons with OB hour data"
         )
-        return karens_seconds, sick_day_ranges, total_hours_by_ob, karens_hours_by_pnr, base_hours_by_pnr, summa_by_pnr
+        return karens_seconds, sick_day_ranges, total_hours_by_ob, karens_hours_by_pnr, base_hours_by_pnr, summa_by_pnr, sem_ers_by_pnr
 
 
 class KarensCalculator:
@@ -1750,9 +1765,10 @@ def process_karens_calculation(
     sjk_karens_hours = {}
     sjk_base_hours = {}
     sjk_summa_by_pnr = {}
+    sjk_sem_ers_by_pnr = {}
     if sjuklonekostnader_path:
         sjk_parser = SjuklonekostnaderParser(config)
-        sjk_karens, sjk_sick_ranges, sjk_total_hours, sjk_karens_hours, sjk_base_hours, sjk_summa_by_pnr = sjk_parser.parse(sjuklonekostnader_path)
+        sjk_karens, sjk_sick_ranges, sjk_total_hours, sjk_karens_hours, sjk_base_hours, sjk_summa_by_pnr, sjk_sem_ers_by_pnr = sjk_parser.parse(sjuklonekostnader_path)
 
         # Merge: payslip data takes priority, sjuklönekostnader fills gaps
         for key, val in sjk_karens.items():
@@ -1760,7 +1776,19 @@ def process_karens_calculation(
                 karens_seconds[key] = val
         for pnr, ranges in sjk_sick_ranges.items():
             sick_day_ranges.setdefault(pnr, []).extend(ranges)
-    
+
+        # Derive timlön from semesterersättning for employees without payslip rate
+        # (e.g. long-term sick dag 15+ where employer pays no salary)
+        # Formula: sem_ers_kr = timlön_100 × total_hours × semester_pct(12%)
+        for pnr, sem_kr in sjk_sem_ers_by_pnr.items():
+            if pnr not in timlon_map and sem_kr > 0:
+                # Total hours = karens + base (all sick hour types for this person)
+                total_hrs = sjk_karens_hours.get(pnr, 0.0) + sjk_base_hours.get(pnr, 0.0)
+                if total_hrs > 0:
+                    derived_rate = round(sem_kr / (total_hrs * 0.12), 2)
+                    timlon_map[pnr] = {"rate": derived_rate, "multi": False}
+                    logger.info(f"Derived timlön for {pnr} from semesterersättning: {sem_kr} / ({total_hrs} x 0.12) = {derived_rate} kr")
+
     # Parse sick list
     sicklist_parser = SickListParser(config)
     sick_df = sicklist_parser.parse_sick_rows(sick_pdf)
