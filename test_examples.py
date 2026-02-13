@@ -19,15 +19,17 @@ def test_ob_classification():
     print("=" * 60)
     
     config = load_config()
-    classifier = OBClassifier(config.holidays)
-    
+    classifier = OBClassifier(config.holidays, config.storhelg)
+
     test_cases = [
-        (datetime(2025, 12, 25, 15, 0), "Helg-OB", "Christmas day afternoon"),
-        (datetime(2025, 12, 23, 23, 0), "Natt", "Tuesday night"),
-        (datetime(2025, 12, 26, 20, 0), "Helg-OB", "Friday evening 20:00"),
-        (datetime(2025, 12, 29, 3, 0), "Helg-OB", "Monday morning 03:00 (after holiday)"),
-        (datetime(2025, 12, 24, 14, 0), "Dag", "Wednesday afternoon"),
-        (datetime(2025, 12, 24, 20, 30), "Kväll", "Wednesday evening 20:30"),
+        (datetime(2025, 12, 25, 15, 0), "Storhelg", "Christmas day afternoon (storhelg)"),
+        (datetime(2025, 12, 23, 23, 0), "Storhelg", "Tue night before Christmas Eve (storhelg transition)"),
+        (datetime(2025, 12, 24, 20, 0), "Storhelg", "Christmas Eve evening 20:00 (storhelg)"),
+        (datetime(2025, 12, 26, 3, 0), "Storhelg", "Annandag jul morning 03:00 (storhelg)"),
+        (datetime(2025, 12, 24, 14, 0), "Storhelg", "Christmas Eve afternoon (storhelg)"),
+        (datetime(2025, 1, 6, 14, 0), "Helg", "Trettondagen afternoon (regular holiday)"),
+        (datetime(2025, 1, 5, 20, 0), "Helg", "Day before Trettondagen 20:00"),
+        (datetime(2025, 12, 29, 3, 0), "Helg", "Monday morning 03:00 (after weekend)"),
     ]
     
     for dt, expected, description in test_cases:
@@ -88,22 +90,25 @@ def test_holiday_detection():
     
     config = load_config()
     holidays = config.holidays
-    
+    storhelg = config.storhelg
+    all_holidays = holidays | storhelg
+
     test_dates = [
-        (date(2025, 12, 25), True, "Christmas"),
-        (date(2025, 12, 24), False, "Day before Christmas"),
-        (date(2025, 12, 26), True, "Boxing Day"),
-        (date(2026, 1, 1), True, "New Year"),
+        (date(2025, 12, 25), "storhelg", "Christmas (storhelg)"),
+        (date(2025, 12, 24), "storhelg", "Christmas Eve (storhelg)"),
+        (date(2025, 12, 26), "storhelg", "Annandag jul (storhelg)"),
+        (date(2026, 1, 1), "storhelg", "New Year (storhelg)"),
+        (date(2025, 1, 6), "holiday", "Trettondagen (regular holiday)"),
+        (date(2025, 5, 1), "holiday", "Första maj (regular holiday)"),
+        (date(2025, 3, 15), "none", "Regular Saturday"),
     ]
-    
-    for test_date, expected, description in test_dates:
-        is_holiday = test_date in holidays
-        is_before = SwedishDateHelper.is_day_before_holiday(test_date, holidays)
-        is_after = SwedishDateHelper.is_day_after_holiday(test_date, holidays)
-        
-        status = "✓" if is_holiday == expected else "✗"
-        print(f"{status} {test_date} ({description:20})")
-        print(f"   Holiday: {is_holiday}, Before: {is_before}, After: {is_after}")
+
+    for test_date, expected_type, description in test_dates:
+        in_holiday = test_date in holidays
+        in_storhelg = test_date in storhelg
+        actual_type = "storhelg" if in_storhelg else ("holiday" if in_holiday else "none")
+        status = "✓" if actual_type == expected_type else "✗"
+        print(f"{status} {test_date} ({description:35}) -> {actual_type}")
     
     print()
 

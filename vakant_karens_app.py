@@ -42,7 +42,8 @@ logger = logging.getLogger(__name__)
 @dataclass
 class Config:
     """Configuration for the karens calculator"""
-    holidays: set[date]
+    holidays: set[date]      # Regular holidays → Helg OB
+    storhelg: set[date]      # Storhelg holidays → Storhelg OB (Påsk, Midsommar, Jul, Nyår)
     sick_list_header_pattern: str = r"Sjuklista\s+(\w+)\s+(\d{4})"
     sick_row_pattern: str = r"^\s*(\d{1,2})\s+(\d{2}:\d{2})\s*-\s*(\d{2}:\d{2})\s+(\d+,\d+)\s+(.*)$"
     payslip_anst_pattern: str = r"Anställningsnr\s*:\s*(\d+)"
@@ -58,8 +59,16 @@ class Config:
 CONFIG_PATH = Path(__file__).parent / "config.yaml"
 
 
-def load_holidays_from_yaml(config_path: Path = CONFIG_PATH) -> Optional[List[date]]:
-    """Load holidays from config.yaml, returns None if file doesn't exist or has no holidays"""
+def _parse_date_list(raw: List) -> List[date]:
+    """Convert a list of date strings/date objects to date objects."""
+    return [d if isinstance(d, date) else date.fromisoformat(str(d)) for d in raw]
+
+
+def load_holidays_from_yaml(config_path: Path = CONFIG_PATH) -> Optional[Tuple[List[date], List[date]]]:
+    """Load holidays and storhelg from config.yaml.
+
+    Returns (holidays, storhelg) tuple, or None if file doesn't exist.
+    """
     try:
         if not config_path.exists():
             return None
@@ -67,14 +76,16 @@ def load_holidays_from_yaml(config_path: Path = CONFIG_PATH) -> Optional[List[da
             data = yaml.safe_load(f)
         if not data or "holidays" not in data:
             return None
-        return [d if isinstance(d, date) else date.fromisoformat(str(d)) for d in data["holidays"]]
+        holidays = _parse_date_list(data["holidays"])
+        storhelg = _parse_date_list(data.get("storhelg", []))
+        return holidays, storhelg
     except Exception as e:
         logger.warning(f"Could not load holidays from {config_path}: {e}")
         return None
 
 
-def save_holidays_to_yaml(holidays: List[date], config_path: Path = CONFIG_PATH):
-    """Save holidays to config.yaml, preserving other config sections"""
+def save_holidays_to_yaml(holidays: List[date], storhelg: Optional[List[date]] = None, config_path: Path = CONFIG_PATH):
+    """Save holidays (and optionally storhelg) to config.yaml, preserving other config sections"""
     data = {}
     try:
         if config_path.exists():
@@ -84,10 +95,12 @@ def save_holidays_to_yaml(holidays: List[date], config_path: Path = CONFIG_PATH)
         logger.warning(f"Could not read existing config: {e}")
 
     data["holidays"] = sorted([d.isoformat() for d in holidays])
+    if storhelg is not None:
+        data["storhelg"] = sorted([d.isoformat() for d in storhelg])
 
     with open(config_path, "w", encoding="utf-8") as f:
         yaml.dump(data, f, default_flow_style=False, allow_unicode=True, sort_keys=False)
-    logger.info(f"Saved {len(holidays)} holidays to {config_path}")
+    logger.info(f"Saved {len(holidays)} holidays and {len(storhelg or [])} storhelg to {config_path}")
 
 
 def load_berakningsar_rates(year: str, config_path: Path = CONFIG_PATH) -> Optional[Dict]:
@@ -121,21 +134,26 @@ OB_RATE_KEYS = {
 }
 
 
-def load_config(holidays: Optional[List[date]] = None, config_path: Path = CONFIG_PATH) -> Config:
-    """Load configuration, reading holidays from config.yaml if not provided"""
+def load_config(holidays: Optional[List[date]] = None, storhelg: Optional[List[date]] = None, config_path: Path = CONFIG_PATH) -> Config:
+    """Load configuration, reading holidays and storhelg from config.yaml if not provided"""
     if holidays is None:
-        holidays = load_holidays_from_yaml(config_path)
+        result = load_holidays_from_yaml(config_path)
+        if result is not None:
+            holidays, storhelg_from_yaml = result
+            if storhelg is None:
+                storhelg = storhelg_from_yaml
     if holidays is None:
         # Fallback hardcoded defaults
         holidays = [
-            date(2025, 12, 25), date(2025, 12, 26),  # Christmas
-            date(2026, 1, 1), date(2026, 1, 6),  # New Year & Epiphany
-            date(2026, 4, 10), date(2026, 4, 13),  # Easter
-            date(2026, 5, 1), date(2026, 5, 21),  # May Day & Ascension
-            date(2026, 6, 6), date(2026, 6, 19),  # National Day & Midsummer
-            date(2025, 12, 31),  # New Year's Eve
+            date(2025, 5, 1), date(2025, 5, 29),  # May Day & Ascension
+            date(2025, 6, 6),  # National Day
         ]
-    return Config(holidays=set(holidays))
+    if storhelg is None:
+        storhelg = [
+            date(2025, 12, 24), date(2025, 12, 25), date(2025, 12, 26),  # Christmas
+            date(2025, 12, 31), date(2026, 1, 1),  # New Year
+        ]
+    return Config(holidays=set(holidays), storhelg=set(storhelg))
 
 
 class SwedishDateHelper:
@@ -170,18 +188,21 @@ class SwedishDateHelper:
 class OBClassifier:
     """Classify time periods into OB (unsocial hours) categories"""
 
-    def __init__(self, holidays: set[date]):
-        self.holidays = holidays
+    def __init__(self, holidays: set[date], storhelg: Optional[set[date]] = None):
+        self.holidays = holidays        # Regular holidays → Helg OB
+        self.storhelg = storhelg or set()  # Storhelg holidays → Storhelg OB
 
     def classify(self, dt: datetime) -> str:
         """
         Classify a datetime into OB category
 
         Categories:
-        - Storhelg: Named holidays (from config) 00:00-24:00,
-                    day-before-holiday 19:00-24:00, day-after-holiday 00:00-07:00
-        - Helg: Saturday/Sunday 00:00-24:00,
-                Friday 19:00-24:00, Monday 00:00-07:00
+        - Storhelg: Storhelg dates (Påsk, Midsommar, Jul, Nyår) 00:00-24:00,
+                    day-before-storhelg 19:00-24:00, day-after-storhelg 00:00-07:00
+        - Helg: Saturday/Sunday 00:00-24:00, regular holidays 00:00-24:00,
+                Friday 19:00-24:00, Monday 00:00-07:00,
+                day-before-regular-holiday 19:00-24:00,
+                day-after-regular-holiday 00:00-07:00
         - Natt: Weekday 22:00-06:00
         - Kväll: Weekday 19:00-22:00
         - Dag: Weekday 06:00-19:00 (no OB)
@@ -189,31 +210,32 @@ class OBClassifier:
         d = dt.date()
         t = dt.time()
 
-        # Named holidays (Storhelg) — full day
-        if d in self.holidays:
+        # Storhelg holidays — full day
+        if d in self.storhelg:
             return "Storhelg"
+
+        # Regular holidays — full day → Helg OB (not Storhelg)
+        if d in self.holidays:
+            return "Helg"
 
         # Regular weekends (Sat/Sun) — full day
         if d.weekday() >= 5:
             return "Helg"
 
-        # Evening/night transitions into weekends and holidays
-        # Friday 19:00+ leads into Saturday → Helg
-        # Day-before-holiday 19:00+ leads into holiday → Storhelg
+        # Evening/night transitions (19:00+) into next day
         if t >= time(19, 0):
             next_day = d + timedelta(days=1)
-            if next_day in self.holidays:
+            if next_day in self.storhelg:
                 return "Storhelg"
-            if d.weekday() == 4:  # Friday
+            if next_day in self.holidays or d.weekday() == 4:  # Friday or day-before-holiday
                 return "Helg"
 
-        # Monday 00:00-07:00 tail of weekend → Helg
-        # Day-after-holiday 00:00-07:00 tail of holiday → Storhelg
+        # Morning transitions (00:00-07:00) trailing from previous day
         if t < time(7, 0):
             prev_day = d - timedelta(days=1)
-            if prev_day in self.holidays:
+            if prev_day in self.storhelg:
                 return "Storhelg"
-            if d.weekday() == 0:  # Monday
+            if prev_day in self.holidays or d.weekday() == 0:  # Monday or day-after-holiday
                 return "Helg"
 
         # Night (22:00-06:00) — already handled Friday/Monday above
@@ -840,7 +862,7 @@ class KarensCalculator:
     
     def __init__(self, config: Config):
         self.config = config
-        self.ob_classifier = OBClassifier(config.holidays)
+        self.ob_classifier = OBClassifier(config.holidays, config.storhelg)
     
     def in_gt14(self, gt14_ranges: Dict, pnr: str, d: date) -> bool:
         """Check if date falls within a GT14 (>14 days sick) period"""
@@ -955,34 +977,32 @@ class KarensCalculator:
             if karens_remaining is not None:
                 karens_remaining_by_pnr[pnr] = karens_remaining
 
-            # Classify jour OB once per date
-            jour_ob_class = None
-            if d.weekday() >= 5 or d in self.config.holidays:
-                jour_ob_class = "Sjuk jourers helg"
-            else:
-                jour_ob_class = "Sjuk jourers vardag"
-
             # Create segments only for VACANT intervals
             for start_dt, end_dt, is_vacant, is_jour, karens_in_interval, mode in interval_cuts:
                 if not is_vacant:
                     continue
 
                 if is_jour:
-                    # Jour segments: single segment per interval, flat OB class
-                    offset = (start_dt - start_dt).total_seconds()  # always 0 for full interval
-                    status = self._status_for_offset(mode, karens_in_interval, offset)
-                    dur_sec = (end_dt - start_dt).total_seconds()
-                    detail_segments.append({
-                        "Anställningsnr": anst_map.get(pnr),
-                        "Personnummer": pnr,
-                        "Namn": grp["Namn"].iloc[0],
-                        "Datum": start_dt.date().isoformat(),
-                        "Start": start_dt.strftime("%H:%M"),
-                        "Slut": end_dt.strftime("%H:%M"),
-                        "Timmar": round(dur_sec / 3600.0, 4),
-                        "OB-klass": jour_ob_class,
-                        "Status": status
-                    })
+                    # Jour segments: split at the helg/vardag boundary (06:00)
+                    # so e.g. Mon 00:00-06:00 is helg (trailing Sunday) while
+                    # Mon 06:00-08:00 is vardag.  Jour uses 06:00 boundary, not
+                    # the regular OB 07:00 boundary.
+                    jour_segs = self._split_jour_by_helg(
+                        start_dt, end_dt, karens_in_interval, mode
+                    )
+                    for seg_start, seg_end, jour_ob, seg_status in jour_segs:
+                        dur_sec = (seg_end - seg_start).total_seconds()
+                        detail_segments.append({
+                            "Anställningsnr": anst_map.get(pnr),
+                            "Personnummer": pnr,
+                            "Namn": grp["Namn"].iloc[0],
+                            "Datum": seg_start.date().isoformat(),
+                            "Start": seg_start.strftime("%H:%M"),
+                            "Slut": seg_end.strftime("%H:%M"),
+                            "Timmar": round(dur_sec / 3600.0, 4),
+                            "OB-klass": jour_ob,
+                            "Status": seg_status
+                        })
                 else:
                     # Regular segments: split by OB boundaries
                     segments = self._split_by_boundaries(
@@ -1003,6 +1023,66 @@ class KarensCalculator:
         
         return pd.DataFrame(detail_segments)
     
+    def _is_jour_helg(self, dt: datetime) -> bool:
+        """Check if a datetime falls in jour-helg territory.
+
+        Jour uses a 06:00 boundary (not 07:00 like regular OB):
+        - Weekends, holidays, storhelg → helg all day
+        - Mon 00:00-06:00 (trailing Sunday) → helg
+        - Day-after-holiday 00:00-06:00 → helg
+        - Fri 19:00-24:00 (leading into Saturday) → helg
+        - Day-before-holiday 19:00-24:00 → helg
+        """
+        d = dt.date()
+        t = dt.time()
+
+        if d in self.config.storhelg or d in self.config.holidays:
+            return True
+        if d.weekday() >= 5:
+            return True
+        # Evening before helg day
+        if t >= time(19, 0):
+            nxt = d + timedelta(days=1)
+            if nxt in self.config.storhelg or nxt in self.config.holidays or d.weekday() == 4:
+                return True
+        # Morning after helg day (06:00 boundary for jour)
+        if t < time(6, 0):
+            prev = d - timedelta(days=1)
+            if prev in self.config.storhelg or prev in self.config.holidays or d.weekday() == 0:
+                return True
+        return False
+
+    def _split_jour_by_helg(
+        self,
+        start_dt: datetime,
+        end_dt: datetime,
+        karens_in_interval: float,
+        mode: str,
+    ) -> List[Tuple]:
+        """Split a jour interval at helg/vardag boundaries (06:00, 19:00, midnight).
+
+        Returns list of (seg_start, seg_end, jour_ob_class, status) tuples.
+        """
+        result = []
+        cur = start_dt
+        while cur < end_dt:
+            dcur = cur.date()
+            # Potential transition points for jour helg/vardag
+            boundaries = [
+                datetime.combine(dcur, time(6, 0)),
+                datetime.combine(dcur, time(19, 0)),
+                datetime.combine(dcur + timedelta(days=1), time(0, 0)),
+            ]
+            nb = min([b for b in boundaries if b > cur] + [end_dt])
+
+            is_helg = self._is_jour_helg(cur)
+            jour_ob = "Sjuk jourers helg" if is_helg else "Sjuk jourers vardag"
+            offset = (cur - start_dt).total_seconds()
+            status = self._status_for_offset(mode, karens_in_interval, offset)
+            result.append((cur, nb, jour_ob, status))
+            cur = nb
+        return result
+
     def _split_by_boundaries(
         self,
         start_dt: datetime,

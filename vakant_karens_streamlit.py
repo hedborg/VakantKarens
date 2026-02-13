@@ -187,10 +187,16 @@ def main():
         st.subheader("Helgdagar")
         st.markdown("Hantera helgdagar (sparas i config.yaml):")
 
-        # Load holidays from config.yaml
+        # Load holidays and storhelg from config.yaml
         if "holidays" not in st.session_state:
             loaded = load_holidays_from_yaml()
-            st.session_state.holidays = sorted(loaded) if loaded else []
+            if loaded:
+                holidays_list, storhelg_list = loaded
+                st.session_state.holidays = sorted(holidays_list)
+                st.session_state.storhelg = sorted(storhelg_list)
+            else:
+                st.session_state.holidays = []
+                st.session_state.storhelg = []
 
         # Show current holidays
         with st.expander(f"Visa alla helgdagar ({len(st.session_state.holidays)})"):
@@ -199,7 +205,7 @@ def main():
                 col1.text(f"{h.strftime('%Y-%m-%d (%A)')}")
                 if col2.button("❌", key=f"remove_{h}"):
                     st.session_state.holidays.remove(h)
-                    save_holidays_to_yaml(st.session_state.holidays)
+                    save_holidays_to_yaml(st.session_state.holidays, st.session_state.get("storhelg"))
                     st.rerun()
 
         # Add new holiday
