@@ -1527,10 +1527,11 @@ class ReportGenerator:
                             under_23 = True
                             under_23_str = "ja"
 
-                        # Pensioner: 67+ at start of beräkningsår (Jan 1)
+                        # Pensioner: pension_age+ at start of beräkningsår (Jan 1)
+                        pension_age = rates.get("pension_age", 67) if rates else 67
                         ber_year = int(year) if year and year.isdigit() else p_year
                         age_at_year_start = ber_year - birth.year
-                        if age_at_year_start >= 67:
+                        if age_at_year_start >= pension_age:
                             is_pensioner = True
                             pensionar_str = "ja"
                     except (ValueError, IndexError):
@@ -1577,7 +1578,8 @@ class ReportGenerator:
                 ws["A5"] = "Under 23"
                 ws["B5"] = under_23_str
 
-                ws["A6"] = "Pensionär (67+)"
+                pension_age_label = rates.get("pension_age", 67) if rates else 67
+                ws["A6"] = f"Pensionär ({pension_age_label}+)"
                 ws["B6"] = pensionar_str
 
                 ws["A7"] = "Timlön (80%)"
