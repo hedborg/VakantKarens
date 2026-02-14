@@ -368,6 +368,26 @@ def main():
 
         st.success("Beräkning genomförd!")
 
+        # Action buttons at top for quick access
+        btn_col1, btn_col2 = st.columns(2)
+
+        with btn_col1:
+            st.download_button(
+                label="💾 Ladda ner Excel-rapport",
+                data=res["excel_data"],
+                file_name=res["output_name"],
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                use_container_width=True,
+                key="dl_top",
+            )
+
+        with btn_col2:
+            if st.button("🗑️ Rensa och ladda upp nya dokument", use_container_width=True, key="reset_top"):
+                st.session_state.result = None
+                if "all_pdfs" in st.session_state:
+                    del st.session_state["all_pdfs"]
+                st.rerun()
+
         # Show current beräkningsår and recalculate option
         current_year = res.get("berakningsar_used", "")
         # Try to get the actual year used from employee metadata
@@ -508,25 +528,6 @@ def main():
                     st.markdown(label)
                 st.dataframe(employee_sheets[selected_emp], use_container_width=True)
 
-        # Download and reset buttons
-        btn_col1, btn_col2 = st.columns(2)
-
-        with btn_col1:
-            st.download_button(
-                label="💾 Ladda ner Excel-rapport",
-                data=res["excel_data"],
-                file_name=res["output_name"],
-                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                use_container_width=True
-            )
-
-        with btn_col2:
-            if st.button("🗑️ Rensa och ladda upp nya dokument", use_container_width=True):
-                st.session_state.result = None
-                # Clear the file uploader
-                if "all_pdfs" in st.session_state:
-                    del st.session_state["all_pdfs"]
-                st.rerun()
     
     # Footer
     st.divider()
