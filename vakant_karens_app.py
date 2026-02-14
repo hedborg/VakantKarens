@@ -951,7 +951,9 @@ class KarensCalculator:
             # Determine if this is the actual karens day (day 1 of sick period)
             is_karens_day = ksec_total is not None and ksec_total > 0
 
-            # Process each interval and apply karens consumption
+            # Process each interval and apply karens consumption.
+            # Jour intervals are NEVER subject to karens deduction — only
+            # regular hours count toward the karens balance.
             interval_cuts = []
             for start_dt, end_dt, is_vacant, is_jour in intervals:
                 if gt14:
@@ -960,6 +962,12 @@ class KarensCalculator:
 
                 if karens_remaining is None:
                     interval_cuts.append((start_dt, end_dt, is_vacant, is_jour, 0.0, "UNKNOWN"))
+                    continue
+
+                # Jour intervals bypass karens entirely — always paid
+                if is_jour:
+                    mode = "PAID_DAY1" if is_karens_day else "PAID"
+                    interval_cuts.append((start_dt, end_dt, is_vacant, is_jour, 0.0, mode))
                     continue
 
                 dur = (end_dt - start_dt).total_seconds()
@@ -1352,14 +1360,18 @@ class ReportGenerator:
             })
 
         # "Sjuklön (timlön)" — use base hours (not sum of OB rows which includes supplements)
-        # Jour vacancy hours are OB supplements with a separate rate and are
-        # already accounted for on their own rows ("Sjuk jourers helg/vardag").
-        # They must NOT be deducted again from the timlön summary.
+        # Only deduct vacancy hours for OB categories that have sjuklönekostnader
+        # backing.  If sjuklönekostnader reports 0 hours for a category (e.g. jour),
+        # those vacancy hours must NOT be deducted from timlön either.
+        # "Dag" vacancy is always deducted from timlön (it IS base hours, not a
+        # separate OB supplement), so use actual vacancy, not sjk-capped value.
         JOUR_OB_CLASSES = {"Sjuk jourers helg", "Sjuk jourers vardag"}
-        jour_just = sum(
-            just_by_ob.get(ob, 0.0) for ob in JOUR_OB_CLASSES
+        ob_supplement_just = sum(
+            v for k, v in just_by_ob.items()
+            if k not in JOUR_OB_CLASSES and k != "Dag"
         )
-        non_jour_just = round(actual_total_just - jour_just, 2)
+        dag_just = vacancy_by_ob.get("Dag", 0.0)
+        non_jour_just = round(ob_supplement_just + dag_just, 2)
 
         total_sjk = round(base_hours, 2)
         total_just = round(min(total_sjk, non_jour_just), 2)
