@@ -1214,6 +1214,56 @@ class ReportGenerator:
         return detail
     
     @staticmethod
+    def detect_dubbelvakans(detail: pd.DataFrame, sick_df: pd.DataFrame) -> pd.DataFrame:
+        """Flag detail rows where another person is also sick for the same time slot.
+
+        A 'dubbelvakans' occurs when a replacement is also sick, e.g.:
+        Sandra is sick → replaced by Anna, but Anna is also sick → [vakant].
+        Anna's vacant row overlaps Sandra's sick interval on the same date.
+        """
+        if detail.empty:
+            detail["Dubbelvakans"] = pd.Series(dtype=str)
+            return detail
+
+        # Build lookup: date_str → list of (start_minutes, end_minutes, pnr)
+        # from ALL sick entries (both vacant and non-vacant)
+        from collections import defaultdict
+        date_intervals: Dict[str, list] = defaultdict(list)
+        for _, r in sick_df.iterrows():
+            d = pd.to_datetime(r["Datum"]).date().isoformat()
+            sh, sm = map(int, r["Start"].split(":"))
+            eh, em = map(int, r["Slut"].split(":"))
+            s_min = sh * 60 + sm
+            e_min = eh * 60 + em
+            if e_min <= s_min:
+                e_min += 24 * 60  # overnight
+            date_intervals[d].append((s_min, e_min, str(r["Personnummer"])))
+
+        flags = []
+        for _, row in detail.iterrows():
+            d = row["Datum"]
+            pnr = str(row["Personnummer"])
+            sh, sm = map(int, row["Start"].split(":"))
+            eh, em = map(int, row["Slut"].split(":"))
+            s_min = sh * 60 + sm
+            e_min = eh * 60 + em
+            if e_min <= s_min:
+                e_min += 24 * 60
+
+            found = False
+            for other_s, other_e, other_pnr in date_intervals.get(d, []):
+                if other_pnr == pnr:
+                    continue
+                # Overlap check: A_start < B_end AND B_start < A_end
+                if s_min < other_e and other_s < e_min:
+                    found = True
+                    break
+            flags.append("Ja" if found else "")
+
+        detail["Dubbelvakans"] = flags
+        return detail
+
+    @staticmethod
     def sort_chronologically(detail: pd.DataFrame) -> pd.DataFrame:
         """Sort segments chronologically"""
         detail["Datum_dt"] = pd.to_datetime(detail["Datum"])
@@ -1927,6 +1977,7 @@ def process_karens_calculation(
     # Post-process
     detail = ReportGenerator.merge_adjacent_segments(detail)
     detail = ReportGenerator.add_paid_hours_column(detail)
+    detail = ReportGenerator.detect_dubbelvakans(detail, sick_df)
     detail = ReportGenerator.sort_chronologically(detail)
 
     # Extract code from sick list filename (e.g. "Sjuklista_013_202405.pdf" -> "013_202405")
