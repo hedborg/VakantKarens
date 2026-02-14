@@ -21,6 +21,7 @@ from vakant_karens_app import (
     load_holidays_from_yaml,
     save_holidays_to_yaml,
     load_berakningsar_rates,
+    load_berakningsar_years,
     Config,
     CONFIG_PATH,
     APP_VERSION,
@@ -302,12 +303,16 @@ def main():
         )
 
         # Beräkningsår override
-        berakningsar_input = st.text_input(
-            "Beräkningsår (valfritt)",
-            value="",
-            help="Lämna tomt för att använda perioden från sjuklistan. Fyll i t.ex. '2025' för att tvinga ett annat beräkningsår.",
+        available_years = load_berakningsar_years()
+        year_options = ["(automatiskt)"] + available_years
+        berakningsar_choice = st.selectbox(
+            "Beräkningsår",
+            options=year_options,
+            index=0,
+            help="Välj '(automatiskt)' för att använda perioden från sjuklistan, eller välj ett specifikt år.",
             key="berakningsar_input",
         )
+        berakningsar_input = "" if berakningsar_choice == "(automatiskt)" else berakningsar_choice
 
         # Process button
         st.divider()
@@ -399,11 +404,17 @@ def main():
                     break
 
         with st.expander(f"Beräkningsår: {current_year or '(okänt)'} — Ändra?", expanded=False):
-            new_year = st.text_input(
+            recalc_years = load_berakningsar_years()
+            try:
+                recalc_default = recalc_years.index(current_year)
+            except (ValueError, IndexError):
+                recalc_default = 0
+            new_year = st.selectbox(
                 "Nytt beräkningsår",
-                value=current_year,
+                options=recalc_years,
+                index=recalc_default,
                 key="recalc_year",
-                help="Ange beräkningsår (t.ex. 2025) och klicka Beräkna om",
+                help="Välj beräkningsår och klicka Beräkna om",
             )
             if st.button("Beräkna om", type="primary", key="recalc_btn"):
                 try:

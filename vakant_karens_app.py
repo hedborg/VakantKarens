@@ -103,6 +103,20 @@ def save_holidays_to_yaml(holidays: List[date], storhelg: Optional[List[date]] =
     logger.info(f"Saved {len(holidays)} holidays and {len(storhelg or [])} storhelg to {config_path}")
 
 
+def load_berakningsar_years(config_path: Path = CONFIG_PATH) -> List[str]:
+    """Return available beräkningsår from config, sorted descending (newest first)."""
+    try:
+        if not config_path.exists():
+            return []
+        with open(config_path, "r", encoding="utf-8") as f:
+            data = yaml.safe_load(f)
+        if not data or "berakningsar" not in data:
+            return []
+        return sorted(data["berakningsar"].keys(), reverse=True)
+    except Exception:
+        return []
+
+
 def load_berakningsar_rates(year: str, config_path: Path = CONFIG_PATH) -> Optional[Dict]:
     """Load cost rates for a given beräkningsår from config.yaml"""
     try:
