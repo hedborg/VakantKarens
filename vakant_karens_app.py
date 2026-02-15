@@ -1165,7 +1165,7 @@ class KarensCalculator:
         if mode == "PAID":
             return "Sjuklön dag 2-14"
         # KARENS_FULL or KARENS_PART
-        if offset_sec < karens_in_interval:
+        if offset_sec < round(karens_in_interval):
             return "Karens"
         return "Sjuklön dag 1 - utanför karens"
 
