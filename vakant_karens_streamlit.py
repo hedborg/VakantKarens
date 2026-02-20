@@ -92,21 +92,60 @@ def run_and_read_excel(
             for sn in xls.sheet_names:
                 if sn in ("Detalj", "Vakanssammanfattning"):
                     continue
-                raw = pd.read_excel(xls, sheet_name=sn, header=None, nrows=11)
-                first_cell = str(raw.iloc[0, 0]).strip() if not raw.empty else ""
+                raw = pd.read_excel(xls, sheet_name=sn, header=None, nrows=2)
+                first_cell_a1 = str(raw.iloc[0, 0]).strip() if not raw.empty else ""
+                first_cell_b2 = (str(raw.iloc[1, 1]).strip()
+                                 if len(raw) > 1 and len(raw.columns) > 1 else "")
 
-                if first_cell == "Brukare":
-                    meta = {}
-                    meta["brukare"] = raw.iloc[0, 1] if len(raw) > 0 else ""
-                    meta["period"] = raw.iloc[1, 1] if len(raw) > 1 else ""
-                    meta["anställd"] = raw.iloc[2, 1] if len(raw) > 2 else ""
-                    meta["nyckel"] = raw.iloc[3, 1] if len(raw) > 3 else ""
-                    meta["berakningsar"] = raw.iloc[9, 1] if len(raw) > 9 else ""
-                    timlon_100 = raw.iloc[8, 1] if len(raw) > 8 else None
-                    if timlon_100 is not None and pd.notna(timlon_100):
-                        employee_timlon[sn] = {"rate": float(timlon_100), "multi": False}
-                    employee_metadata[sn] = meta
-                    tbl = pd.read_excel(xls, sheet_name=sn, header=None, skiprows=13)
+                # Current format: metadata first (A1="Brukare"), data from row 24.
+                #   Row 22 = group headers, row 23 = col sub-headers, row 24+ = data.
+                #   Detect: A1="Brukare" AND row-2 col-B is NOT "Timmar".
+                # Old/intermediate format: A1="Brukare", sub-headers at row 2 col B = "Timmar".
+                # Even-older format: A1="Timlön".
+                new_format = (first_cell_a1 == "Brukare" and first_cell_b2 != "Timmar")
+                old_format  = (first_cell_a1 == "Brukare" and first_cell_b2 == "Timmar")
+
+                if new_format or old_format:
+                    if new_format:
+                        # Fixed metadata layout (1-based row numbers):
+                        # 1=Brukare, 2=Period, 3=Anställd, 4=Nyckel,
+                        # 7=Beräkningsår, 10=Timlön(100%)
+                        meta_raw = pd.read_excel(xls, sheet_name=sn, header=None, nrows=14)
+                        def _m(r):  # r is 1-based
+                            return meta_raw.iloc[r - 1, 1] if len(meta_raw) >= r else ""
+                        meta = {
+                            "brukare":      _m(1),
+                            "period":       _m(2),
+                            "anställd":     _m(3),
+                            "nyckel":       _m(4),
+                            "berakningsar": _m(7),
+                        }
+                        timlon_100 = _m(10)
+                        if timlon_100 is not None and pd.notna(timlon_100):
+                            try:
+                                employee_timlon[sn] = {"rate": float(timlon_100), "multi": False}
+                            except (ValueError, TypeError):
+                                pass
+                        employee_metadata[sn] = meta
+                        # Data starts at row 24 (1-based) → skiprows=23
+                        tbl = pd.read_excel(xls, sheet_name=sn, header=None, skiprows=23)
+                    else:
+                        # Old format: metadata rows 1-11, group headers row 12,
+                        # sub-headers row 14, data from row 15 (skiprows=13, drop first row)
+                        raw11 = pd.read_excel(xls, sheet_name=sn, header=None, nrows=11)
+                        meta = {
+                            "brukare":      raw11.iloc[0, 1] if len(raw11) > 0 else "",
+                            "period":       raw11.iloc[1, 1] if len(raw11) > 1 else "",
+                            "anställd":     raw11.iloc[2, 1] if len(raw11) > 2 else "",
+                            "nyckel":       raw11.iloc[3, 1] if len(raw11) > 3 else "",
+                            "berakningsar": raw11.iloc[9, 1] if len(raw11) > 9 else "",
+                        }
+                        timlon_100 = raw11.iloc[8, 1] if len(raw11) > 8 else None
+                        if timlon_100 is not None and pd.notna(timlon_100):
+                            employee_timlon[sn] = {"rate": float(timlon_100), "multi": False}
+                        employee_metadata[sn] = meta
+                        tbl = pd.read_excel(xls, sheet_name=sn, header=None, skiprows=13)
+
                     if not tbl.empty:
                         ncols = len(tbl.columns)
                         if ncols == 7:
@@ -120,29 +159,30 @@ def run_and_read_excel(
                             tbl.columns = ["OB-klass", "Enl. sjuklönekostnader", "Justering för vakanser", "Netto"]
                         else:
                             tbl.columns = [f"Kol{i}" for i in range(ncols)]
-                        tbl = tbl.iloc[1:]
+                        if old_format:
+                            tbl = tbl.iloc[1:]  # old format has an extra sub-header row to skip
                         tbl = tbl.dropna(how="all").reset_index(drop=True)
 
                         # Extract validation row if present
-                        kontroll = tbl[tbl["OB-klass"] == "Kontroll mot Sjuklönekostnader"]
-                        if not kontroll.empty:
-                            row = kontroll.iloc[0]
-                            our_val = row.get("Sjk Timmar", row.iloc[1]) if ncols == 7 else None
-                            pdf_val = row.get("Sjk Kronor", row.iloc[2]) if ncols == 7 else None
-                            flag = row.get("Just Timmar", row.iloc[3]) if ncols == 7 else None
-                            if our_val is not None and pdf_val is not None:
-                                validation_rows.append({
-                                    "Anställd": sn,
-                                    "Vår Summa (kr)": int(our_val) if pd.notna(our_val) else "",
-                                    "PDF Summa (kr)": int(pdf_val) if pd.notna(pdf_val) else "",
-                                    "Status": str(flag) if pd.notna(flag) else "",
-                                })
-                            # Remove validation row from displayed table
-                            tbl = tbl[tbl["OB-klass"] != "Kontroll mot Sjuklönekostnader"].reset_index(drop=True)
+                        if "OB-klass" in tbl.columns:
+                            kontroll = tbl[tbl["OB-klass"].astype(str) == "Kontroll mot Sjuklönekostnader"]
+                            if not kontroll.empty:
+                                row = kontroll.iloc[0]
+                                our_val = row.get("Sjk Timmar", row.iloc[1]) if ncols == 7 else None
+                                pdf_val = row.get("Sjk Kronor", row.iloc[2]) if ncols == 7 else None
+                                flag    = row.get("Just Timmar", row.iloc[3]) if ncols == 7 else None
+                                if our_val is not None and pdf_val is not None:
+                                    validation_rows.append({
+                                        "Anställd": sn,
+                                        "Vår Summa (kr)": int(our_val) if pd.notna(our_val) else "",
+                                        "PDF Summa (kr)": int(pdf_val) if pd.notna(pdf_val) else "",
+                                        "Status": str(flag) if pd.notna(flag) else "",
+                                    })
+                                tbl = tbl[tbl["OB-klass"].astype(str) != "Kontroll mot Sjuklönekostnader"].reset_index(drop=True)
 
                     employee_sheets[sn] = tbl
 
-                elif first_cell == "Timlön":
+                elif first_cell_a1 == "Timlön":
                     rate = raw.iloc[0, 1]
                     multi = len(raw.columns) > 2 and pd.notna(raw.iloc[0, 2])
                     employee_timlon[sn] = {"rate": rate, "multi": multi}

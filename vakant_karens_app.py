@@ -1717,11 +1717,11 @@ class ReportGenerator:
                     is_pensioner=is_pensioner,
                 )
 
-                # Capture justering total for summary sheet (vacancy cost)
+                # Capture justering total and nyckel for use later in the sheet block
                 summa_row = next((r for r in sheet_data if r["ob_class"] == "_summa"), None)
                 nyckel = f"{brukare}_{period}_{anst}" if anst else pnr
                 just_total = summa_row["justering_kronor"] if summa_row else 0.0
-                summary_rows.append((nyckel, just_total))
+                # summary_rows is appended at end of employee sheet block (after sheet_name known)
 
                 # Build sheet name (max 31 chars for Excel)
                 sheet_name = str(anst)[:31] if anst else pnr[:31]
@@ -1735,148 +1735,311 @@ class ReportGenerator:
                 ws = writer.book.create_sheet(sheet_name)
 
                 sjklon_procent = rates.get("sjuklon_procent", 0.80) if rates else 0.80
-
-                # ── Metadata (rows 1-11) ──
-                ws["A1"] = "Brukare"
-                ws["B1"] = brukare
-
-                ws["A2"] = "Period"
-                ws["B2"] = period
-
-                ws["A3"] = "Anställd"
-                ws["B3"] = anst or ""
-
-                ws["A4"] = "Nyckel"
-                ws["B4"] = f"{brukare}_{period}_{anst}" if anst else ""
-
-                ws["A5"] = "Under 23"
-                ws["B5"] = under_23_str
-
                 pension_age_label = rates.get("pension_age", 67) if rates else 67
-                ws["A6"] = f"Pensionär ({pension_age_label}+)"
-                ws["B6"] = pensionar_str
+                sem_pct = rates.get("semester_ersattning", 0.12) if rates else 0.12
+                forsakring_pct = 0.0
+                if rates:
+                    forsakring_pct = (
+                        rates.get("forsakring_procent_under25", 0.0)
+                        if under_23 else rates.get("forsakring_procent", 0.0)
+                    )
+                if rates and is_pensioner:
+                    soc_avg_pct = rates.get("sociala_avgifter_pens", 0.1021)
+                else:
+                    soc_avg_pct = rates.get("sociala_avgifter", 0.3142) if rates else 0.3142
 
-                ws["A7"] = "Timlön (80%)"
-                ws["B7"] = round(timlon_rate * sjklon_procent, 2) if timlon_rate else ""
-
-                ws["A8"] = "Sjuklönprocent"
-                if timlon_rate:
-                    ws["B8"] = sjklon_procent
-                    ws["B8"].number_format = '0.00%'
-
-                ws["A9"] = "Timlön (100%)"
-                ws["B9"] = timlon_rate if timlon_rate else ""
-
-                ws["A10"] = "Beräkningsår"
-                ws["B10"] = year if year else ""
-
-                ws["A11"] = "Beräknare"
-                ws["B11"] = "APP"
-
-                # ── Table (rows 12+) ──
-                # Column layout: A=label, B=sjk_timmar, C=sjk_kronor,
+                # ── Metadata block (rows 1–N) ──
+                # Column layout throughout: A=label, B=value/sjk_timmar, C=sjk_kronor,
                 #   D=just_timmar, E=just_kronor, F=netto_timmar, G=netto_kronor
+                #
+                # Metadata occupies column A (label) and B (value).
+                # Row numbers are fixed and known before the data table, so all
+                # formula references can be written in a single pass.
+                #
+                # Row  1 : Brukare
+                # Row  2 : Period
+                # Row  3 : Anställd
+                # Row  4 : Nyckel
+                # Row  5 : Under 23
+                # Row  6 : Pensionär (age+)
+                # Row  7 : Beräkningsår
+                # Row  8 : Beräknare
+                # Row  9 : Sjuklöneprocent
+                # Row 10 : Timlön (100%)
+                # Row 11 : Timlön (80%)          formula =B10*B9
+                # Row 12 : Semesterersättning %
+                # Row 13 : Försäkringar %
+                # Row 14 : Sociala avgifter %
+                # Row 15 : OB Sjuk jourers helg  formula =<raw_rate>*B9
+                # Row 16 : OB Sjuk jourers vardag
+                # Row 17 : OB Storhelg
+                # Row 18 : OB Helg
+                # Row 19 : OB Natt
+                # Row 20 : OB Kväll
+                # (blank row 21)
+                # Row 22 : group headers
+                # Row 23 : column sub-headers
+                # Row 24+: data rows
 
-                # Group headers (row 12)
-                ws.cell(row=12, column=2, value="Enligt sjuklönekostnader")
-                ws.cell(row=12, column=4, value="Justering för vakanser")
-                ws.cell(row=12, column=6, value="Netto")
+                META = {
+                    "brukare":    1,
+                    "period":     2,
+                    "anst":       3,
+                    "nyckel":     4,
+                    "under23":    5,
+                    "pensionar":  6,
+                    "beraar":     7,
+                    "beraknare":  8,
+                    "sjkprocent": 9,
+                    "timlon100":  10,
+                    "timlon80":   11,
+                    "sempct":     12,
+                    "forspct":    13,
+                    "socpct":     14,
+                }
+                ob_rate_rows: Dict[str, int] = {}
+                for i, ob in enumerate(ReportGenerator.OB_SECTION_ORDER):
+                    ob_rate_rows[ob] = 15 + i   # rows 15–20
 
-                # Sub-headers (row 14)
-                ws.cell(row=14, column=2, value="Timmar")
-                ws.cell(row=14, column=3, value="Kronor")
-                ws.cell(row=14, column=4, value="Timmar")
-                ws.cell(row=14, column=5, value="Kronor")
-                ws.cell(row=14, column=6, value="Timmar")
-                ws.cell(row=14, column=7, value="Kronor")
+                TABLE_GROUP_ROW  = 22
+                TABLE_HEADER_ROW = 23
+                DATA_START_ROW   = 24
 
-                # ── Write data rows ──
-                row_num = 15
+                # Write metadata
+                meta_entries = [
+                    (META["brukare"],   "Brukare",                          brukare),
+                    (META["period"],    "Period",                           period),
+                    (META["anst"],      "Anställd",                         anst or ""),
+                    (META["nyckel"],    "Nyckel",                           f"{brukare}_{period}_{anst}" if anst else ""),
+                    (META["under23"],   "Under 23",                         under_23_str),
+                    (META["pensionar"], f"Pensionär ({pension_age_label}+)", pensionar_str),
+                    (META["beraar"],    "Beräkningsår",                     year if year else ""),
+                    (META["beraknare"], "Beräknare",                        "APP"),
+                    (META["sjkprocent"],"Sjuklöneprocent",                  sjklon_procent),
+                    (META["timlon100"], "Timlön (100%)",                    timlon_rate if timlon_rate else ""),
+                ]
+                for r, label, val in meta_entries:
+                    ws.cell(row=r, column=1, value=label)
+                    c = ws.cell(row=r, column=2, value=val)
+                    if label == "Sjuklöneprocent":
+                        c.number_format = '0.00%'
 
-                # Helper to write one data row
-                def write_row(item, rn):
+                # Timlön (80%) — formula
+                ws.cell(row=META["timlon80"],   column=1, value="Timlön (80%)")
+                ws.cell(row=META["timlon80"],   column=2, value=f"=B{META['timlon100']}*B{META['sjkprocent']}")
+
+                # Rate percentages
+                ws.cell(row=META["sempct"],  column=1, value="Semesterersättning %")
+                c = ws.cell(row=META["sempct"],  column=2, value=sem_pct)
+                c.number_format = '0.00%'
+
+                ws.cell(row=META["forspct"], column=1, value="Försäkringar %")
+                c = ws.cell(row=META["forspct"], column=2, value=forsakring_pct)
+                c.number_format = '0.00%'
+
+                ws.cell(row=META["socpct"],  column=1, value="Sociala avgifter %")
+                c = ws.cell(row=META["socpct"],  column=2, value=soc_avg_pct)
+                c.number_format = '0.00%'
+
+                # OB rate rows (formula = raw_100pct_rate * sjklon_procent)
+                for ob in ReportGenerator.OB_SECTION_ORDER:
+                    key = OB_RATE_KEYS.get(ob)
+                    raw_rate = rates.get(key, 0.0) if (rates and key) else 0.0
+                    ob_r = ob_rate_rows[ob]
+                    ws.cell(row=ob_r, column=1, value=f"OB-tillägg {ReportGenerator.OB_DISPLAY_NAMES[ob]} (80%)")
+                    ws.cell(row=ob_r, column=2, value=f"={raw_rate}*B{META['sjkprocent']}")
+
+                # Group headers
+                ws.cell(row=TABLE_GROUP_ROW, column=2, value="Enligt sjuklönekostnader")
+                ws.cell(row=TABLE_GROUP_ROW, column=4, value="Justering för vakanser")
+                ws.cell(row=TABLE_GROUP_ROW, column=6, value="Netto")
+
+                # Column sub-headers
+                ws.cell(row=TABLE_HEADER_ROW, column=2, value="Timmar")
+                ws.cell(row=TABLE_HEADER_ROW, column=3, value="Kronor")
+                ws.cell(row=TABLE_HEADER_ROW, column=4, value="Timmar")
+                ws.cell(row=TABLE_HEADER_ROW, column=5, value="Kronor")
+                ws.cell(row=TABLE_HEADER_ROW, column=6, value="Timmar")
+                ws.cell(row=TABLE_HEADER_ROW, column=7, value="Kronor")
+
+                # ── Data rows (single pass — all row numbers known) ──
+                row_map: Dict[str, int] = {}
+                row_num = DATA_START_ROW
+
+                # Rows that have NO Timmar columns at all (kronor only, all formula-driven):
+                # _sjk_exkl, _sem_ers, _sjuklon, _summa, _sem_sjk, _forsakring, _soc_avg
+                NO_TIMMAR = ReportGenerator.NO_TIMMAR_ROWS | ReportGenerator.PERCENT_ROWS
+
+                def write_data_row(item, rn):
                     oc = item["ob_class"]
                     ws.cell(row=rn, column=1, value=item["display_name"])
+                    row_map[oc] = rn
 
-                    if oc in ReportGenerator.NO_TIMMAR_ROWS:
-                        # Kronor only — no Timmar columns
-                        ws.cell(row=rn, column=3, value=item.get("sjk_kronor", 0.0))
-                        ws.cell(row=rn, column=5, value=item.get("justering_kronor", 0.0))
-                        ws.cell(row=rn, column=7, value=item.get("netto_kronor", 0.0))
-                    elif oc in ReportGenerator.PERCENT_ROWS:
-                        # Timmar column shows percentage, plus Kronor
-                        pct_val = item.get("sjk_timmar", 0.0)
-                        ws.cell(row=rn, column=2, value=pct_val)
-                        ws.cell(row=rn, column=2).number_format = '0.00%'
-                        ws.cell(row=rn, column=3, value=item.get("sjk_kronor", 0.0))
-                        ws.cell(row=rn, column=4, value=pct_val)
-                        ws.cell(row=rn, column=4).number_format = '0.00%'
-                        ws.cell(row=rn, column=5, value=item.get("justering_kronor", 0.0))
-                        ws.cell(row=rn, column=6, value=pct_val)
-                        ws.cell(row=rn, column=6).number_format = '0.00%'
-                        ws.cell(row=rn, column=7, value=item.get("netto_kronor", 0.0))
+                    if oc in NO_TIMMAR:
+                        # Kronor columns only — written as formulas in pass 2
+                        pass
                     else:
-                        # Normal: Timmar + Kronor
+                        # Normal or _gt14: editable Timmar + formula Kronor/Netto
                         ws.cell(row=rn, column=2, value=item.get("sjk_timmar", 0.0))
-                        ws.cell(row=rn, column=3, value=item.get("sjk_kronor", 0.0))
                         ws.cell(row=rn, column=4, value=item.get("justering_timmar", 0.0))
-                        ws.cell(row=rn, column=5, value=item.get("justering_kronor", 0.0))
-                        ws.cell(row=rn, column=6, value=item.get("netto_timmar", 0.0))
-                        ws.cell(row=rn, column=7, value=item.get("netto_kronor", 0.0))
 
-                # OB rows (14-19)
+                # OB supplement rows
                 for item in sheet_data:
                     if not item["ob_class"].startswith("_"):
-                        write_row(item, row_num)
+                        write_data_row(item, row_num)
                         row_num += 1
 
-                # Blank separator
-                row_num += 1
+                row_num += 1  # blank separator
 
-                # Summary section 1: Sjuklön (timlön), Semesterersättning sjuklön, Karens/GT14
+                # Summary section 1: _summary, _sem_sjk, _gt14
                 for item in sheet_data:
                     if item["ob_class"] in ReportGenerator.SUMMARY_SECTION_1:
-                        write_row(item, row_num)
+                        write_data_row(item, row_num)
                         row_num += 1
 
-                # Blank separator
-                row_num += 1
+                row_num += 1  # blank separator
 
-                # Summary section 2: Sjuklön exkl, Semesterersättning, Sjuklön subtotal
+                # Summary section 2: _sjk_exkl, _sem_ers, _sjuklon
                 for item in sheet_data:
                     if item["ob_class"] in ReportGenerator.SUMMARY_SECTION_2:
-                        write_row(item, row_num)
+                        write_data_row(item, row_num)
                         row_num += 1
 
-                # Fees: Försäkringar, Sociala avgifter
+                # Fees: _forsakring, _soc_avg
                 for item in sheet_data:
                     if item["ob_class"] in ReportGenerator.FEES_SECTION:
-                        write_row(item, row_num)
+                        write_data_row(item, row_num)
                         row_num += 1
 
-                # Blank separator
-                row_num += 1
+                row_num += 1  # blank separator
 
-                # Total: Summa Sjuklönekostnader
+                # Total: _summa
                 for item in sheet_data:
                     if item["ob_class"] in ReportGenerator.TOTAL_SECTION:
-                        write_row(item, row_num)
+                        write_data_row(item, row_num)
                         row_num += 1
 
-                # Validation: compare our Sjk Kronor total vs PDF "Summa"
+                # Validation row (optional)
                 pdf_summa = sjk_summa_by_pnr.get(pnr)
                 if pdf_summa is not None and summa_row is not None:
                     row_num += 1
                     our_total = round(summa_row["sjk_kronor"])
                     pdf_total = round(pdf_summa)
-                    if our_total == pdf_total:
-                        flag = "OK"
-                    else:
-                        flag = f"DIFF ({our_total} vs {pdf_total})"
+                    flag = "OK" if our_total == pdf_total else f"DIFF ({our_total} vs {pdf_total})"
                     ws.cell(row=row_num, column=1, value="Kontroll mot Sjuklönekostnader")
                     ws.cell(row=row_num, column=2, value=our_total)
                     ws.cell(row=row_num, column=3, value=pdf_total)
                     ws.cell(row=row_num, column=4, value=flag)
+
+                # ── Formula pass: Kronor and Netto cells ──
+
+                # OB supplement rows: C=B*rate, E=D*rate, F=B-D, G=C-E
+                for ob in ReportGenerator.OB_SECTION_ORDER:
+                    if ob not in row_map:
+                        continue
+                    rn = row_map[ob]
+                    rate_cell = f"B{ob_rate_rows[ob]}"
+                    ws.cell(row=rn, column=3, value=f"=B{rn}*{rate_cell}")
+                    ws.cell(row=rn, column=5, value=f"=D{rn}*{rate_cell}")
+                    ws.cell(row=rn, column=6, value=f"=B{rn}-D{rn}")
+                    ws.cell(row=rn, column=7, value=f"=C{rn}-E{rn}")
+
+                # _summary (Sjuklön timlön): C=B*timlon80, E=D*timlon80, F=B-D, G=C-E
+                if "_summary" in row_map:
+                    rn = row_map["_summary"]
+                    tl80 = f"B{META['timlon80']}"
+                    ws.cell(row=rn, column=3, value=f"=B{rn}*{tl80}")
+                    ws.cell(row=rn, column=5, value=f"=D{rn}*{tl80}")
+                    ws.cell(row=rn, column=6, value=f"=B{rn}-D{rn}")
+                    ws.cell(row=rn, column=7, value=f"=C{rn}-E{rn}")
+
+                # _sem_sjk: Kronor = _summary timmar * timlon100 * sempct  (no Timmar col)
+                if "_sem_sjk" in row_map and "_summary" in row_map:
+                    rn     = row_map["_sem_sjk"]
+                    sum_rn = row_map["_summary"]
+                    tl100  = f"B{META['timlon100']}"
+                    spct   = f"B{META['sempct']}"
+                    ws.cell(row=rn, column=3, value=f"=B{sum_rn}*{tl100}*{spct}")
+                    ws.cell(row=rn, column=5, value=f"=D{sum_rn}*{tl100}*{spct}")
+                    ws.cell(row=rn, column=7, value=f"=C{rn}-E{rn}")
+
+                # _gt14: C=B*timlon100*sempct, E=D*timlon100*sempct, F=B-D, G=C-E
+                if "_gt14" in row_map:
+                    rn    = row_map["_gt14"]
+                    tl100 = f"B{META['timlon100']}"
+                    spct  = f"B{META['sempct']}"
+                    ws.cell(row=rn, column=3, value=f"=B{rn}*{tl100}*{spct}")
+                    ws.cell(row=rn, column=5, value=f"=D{rn}*{tl100}*{spct}")
+                    ws.cell(row=rn, column=6, value=f"=B{rn}-D{rn}")
+                    ws.cell(row=rn, column=7, value=f"=C{rn}-E{rn}")
+
+                # _sjk_exkl: sum of OB + _summary kronor
+                if "_sjk_exkl" in row_map:
+                    rn = row_map["_sjk_exkl"]
+                    salary_rows = [row_map[ob] for ob in ReportGenerator.OB_SECTION_ORDER
+                                   if ob in row_map]
+                    if "_summary" in row_map:
+                        salary_rows.append(row_map["_summary"])
+                    c_refs = "+".join(f"C{r}" for r in sorted(salary_rows))
+                    e_refs = "+".join(f"E{r}" for r in sorted(salary_rows))
+                    g_refs = "+".join(f"G{r}" for r in sorted(salary_rows))
+                    ws.cell(row=rn, column=3, value=f"={c_refs}")
+                    ws.cell(row=rn, column=5, value=f"={e_refs}")
+                    ws.cell(row=rn, column=7, value=f"={g_refs}")
+
+                # _sem_ers: _sem_sjk + _gt14
+                if "_sem_ers" in row_map:
+                    rn = row_map["_sem_ers"]
+                    sem_rows = [row_map[k] for k in ("_sem_sjk", "_gt14") if k in row_map]
+                    c_refs = "+".join(f"C{r}" for r in sem_rows)
+                    e_refs = "+".join(f"E{r}" for r in sem_rows)
+                    g_refs = "+".join(f"G{r}" for r in sem_rows)
+                    ws.cell(row=rn, column=3, value=f"={c_refs}" if c_refs else "=0")
+                    ws.cell(row=rn, column=5, value=f"={e_refs}" if e_refs else "=0")
+                    ws.cell(row=rn, column=7, value=f"={g_refs}" if g_refs else "=0")
+
+                # _sjuklon: _sjk_exkl + _sem_ers
+                if "_sjuklon" in row_map:
+                    rn   = row_map["_sjuklon"]
+                    exkl = row_map.get("_sjk_exkl")
+                    sers = row_map.get("_sem_ers")
+                    if exkl and sers:
+                        ws.cell(row=rn, column=3, value=f"=C{exkl}+C{sers}")
+                        ws.cell(row=rn, column=5, value=f"=E{exkl}+E{sers}")
+                        ws.cell(row=rn, column=7, value=f"=G{exkl}+G{sers}")
+
+                # _forsakring: Kronor = _sjuklon * forspct  (no Timmar col)
+                if "_forsakring" in row_map and "_sjuklon" in row_map:
+                    rn  = row_map["_forsakring"]
+                    sjl = row_map["_sjuklon"]
+                    ws.cell(row=rn, column=3, value=f"=C{sjl}*B{META['forspct']}")
+                    ws.cell(row=rn, column=5, value=f"=E{sjl}*B{META['forspct']}")
+                    ws.cell(row=rn, column=7, value=f"=G{sjl}*B{META['forspct']}")
+
+                # _soc_avg: Kronor = _sjuklon * socpct  (no Timmar col)
+                if "_soc_avg" in row_map and "_sjuklon" in row_map:
+                    rn  = row_map["_soc_avg"]
+                    sjl = row_map["_sjuklon"]
+                    ws.cell(row=rn, column=3, value=f"=C{sjl}*B{META['socpct']}")
+                    ws.cell(row=rn, column=5, value=f"=E{sjl}*B{META['socpct']}")
+                    ws.cell(row=rn, column=7, value=f"=G{sjl}*B{META['socpct']}")
+
+                # _summa: _sjuklon + _forsakring + _soc_avg
+                if "_summa" in row_map:
+                    rn  = row_map["_summa"]
+                    sjl = row_map.get("_sjuklon")
+                    frs = row_map.get("_forsakring")
+                    soc = row_map.get("_soc_avg")
+                    if sjl and frs and soc:
+                        ws.cell(row=rn, column=3, value=f"=C{sjl}+C{frs}+C{soc}")
+                        ws.cell(row=rn, column=5, value=f"=E{sjl}+E{frs}+E{soc}")
+                        ws.cell(row=rn, column=7, value=f"=G{sjl}+G{frs}+G{soc}")
+
+                # Record the _summa netto cell reference for the summary sheet
+                summa_netto_ref = None
+                if "_summa" in row_map:
+                    summa_netto_ref = f"'{sheet_name}'!E{row_map['_summa']}"
+                summary_rows.append((nyckel, just_total, sheet_name, summa_netto_ref))
 
                 # Set employee sheet column widths
                 for col_letter in ["A", "B", "C", "D", "E", "F", "G"]:
@@ -1885,16 +2048,23 @@ class ReportGenerator:
             # ── Summary sheet: Vakanssammanfattning ──
             ws_sum = writer.book.create_sheet("Vakanssammanfattning", 0)  # insert first
             ws_sum["A1"] = "Vakanskostnader"
-            row_num = 2
-            grand_total = 0.0
-            for nyckel, netto_kr in summary_rows:
-                ws_sum.cell(row=row_num, column=1, value=nyckel)
-                ws_sum.cell(row=row_num, column=2, value=netto_kr)
-                grand_total += netto_kr
-                row_num += 1
-            row_num += 1
-            ws_sum.cell(row=row_num, column=1, value="Totala vakanskostnader")
-            ws_sum.cell(row=row_num, column=2, value=round(grand_total, 2))
+            sum_row = 2
+            for nyckel, _just_total, _sname, netto_ref in summary_rows:
+                ws_sum.cell(row=sum_row, column=1, value=nyckel)
+                if netto_ref:
+                    ws_sum.cell(row=sum_row, column=2, value=f"={netto_ref}")
+                else:
+                    ws_sum.cell(row=sum_row, column=2, value=0.0)
+                sum_row += 1
+            sum_row += 1
+            ws_sum.cell(row=sum_row, column=1, value="Totala vakanskostnader")
+            if summary_rows:
+                refs = "+".join(
+                    f"B{2 + i}" for i in range(len(summary_rows))
+                )
+                ws_sum.cell(row=sum_row, column=2, value=f"={refs}")
+            else:
+                ws_sum.cell(row=sum_row, column=2, value=0.0)
 
             # Set Vakanssammanfattning column widths
             ws_sum.column_dimensions["A"].width = 25
