@@ -1170,6 +1170,76 @@ class KarensCalculator:
         return "Sjuklön dag 1 - utanför karens"
 
 
+def _inject_formulas_into_xlsx(path: str, formula_map: Dict[str, Dict[Tuple[int, int], str]]) -> None:
+    """Post-process an xlsx file to inject <f>formula</f> elements into cells that already
+    carry pre-computed numeric <v> values.  This gives pandas/openpyxl (data_only=True) the
+    cached numeric value while still providing Excel with live formulas.
+
+    path        – path to the saved xlsx file (modified in-place)
+    formula_map – {sheet_name: {(row_1based, col_1based): "=formula_string"}}
+    """
+    if not formula_map:
+        return
+
+    import zipfile
+    import io
+    from openpyxl.utils import get_column_letter
+
+    # Convert (row, col) → cell-ref, strip leading '='
+    sheet_ref_map: Dict[str, Dict[str, str]] = {}
+    for sname, cells in formula_map.items():
+        refs: Dict[str, str] = {}
+        for (row, col), fml in cells.items():
+            refs[f"{get_column_letter(col)}{row}"] = fml.lstrip("=")
+        sheet_ref_map[sname] = refs
+
+    # Read the whole zip into memory
+    with zipfile.ZipFile(path, "r") as zin:
+        names = zin.namelist()
+        raw: Dict[str, bytes] = {n: zin.read(n) for n in names}
+
+    # Resolve sheet name → internal XML path via workbook + rels
+    wb_text   = raw.get("xl/workbook.xml",             b"").decode("utf-8")
+    rels_text = raw.get("xl/_rels/workbook.xml.rels",  b"").decode("utf-8")
+
+    rid_to_file: Dict[str, str] = {}
+    for m in re.finditer(r'<Relationship\b[^>]*\bId="([^"]+)"[^>]*\bTarget="([^"]+)"', rels_text):
+        rid_to_file[m.group(1)] = m.group(2)
+
+    name_to_path: Dict[str, str] = {}
+    for m in re.finditer(r'<sheet\b[^>]*\bname="([^"]+)"[^>]*\br:id="([^"]+)"', wb_text):
+        sname, rid = m.group(1), m.group(2)
+        target = rid_to_file.get(rid, "")
+        if target:
+            name_to_path[sname] = "xl/" + target if not target.startswith("xl/") else target
+
+    modified: Dict[str, bytes] = {}
+    for sname, refs in sheet_ref_map.items():
+        fpath = name_to_path.get(sname)
+        if not fpath or fpath not in raw:
+            continue
+        xml_text = raw[fpath].decode("utf-8")
+        for ref, formula in refs.items():
+            # Inject <f>formula</f> immediately after the cell's opening tag.
+            # The cell already has a <v> from the numeric write, so the result is:
+            #   <c r="C5" s="..."><f>B5*B15</f><v>123.45</v></c>
+            xml_text = re.sub(
+                r'(<c\s+r="' + re.escape(ref) + r'"[^>]*>)',
+                r'\1<f>' + formula + r'</f>',
+                xml_text,
+            )
+        modified[fpath] = xml_text.encode("utf-8")
+
+    # Re-pack zip with modified sheets
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zout:
+        for name in names:
+            zout.writestr(name, modified.get(name, raw[name]))
+    buf.seek(0)
+    with open(path, "wb") as f:
+        f.write(buf.read())
+
+
 class ReportGenerator:
     """Generate Excel reports from calculated segments"""
     
@@ -1655,6 +1725,11 @@ class ReportGenerator:
         period = parts[1] if len(parts) >= 2 else ""
         year = berakningsar or (period[:4] if len(period) >= 4 else "")
 
+        # Collect formula strings keyed by (sheet_name, row, col) for post-processing.
+        # We write numeric cached values to the cells; _inject_formulas_into_xlsx() later
+        # injects the <f> elements so Excel still gets live, interactive formulas.
+        formula_cache: Dict[str, Dict[Tuple[int, int], str]] = {}
+
         with pd.ExcelWriter(output_path, engine="openpyxl") as writer:
             # Sheet 1: Full detail
             detail.to_excel(writer, sheet_name="Detalj", index=False)
@@ -1731,6 +1806,12 @@ class ReportGenerator:
                     sheet_name = f"{base_name[:28]}_{counter}"
                     counter += 1
                 used_names.add(sheet_name)
+
+                # Per-sheet formula cache: {(row, col): "=formula_string"}
+                sn_fc: Dict[Tuple[int, int], str] = {}
+                formula_cache[sheet_name] = sn_fc
+                # Quick lookup for pre-computed numeric values
+                item_map: Dict[str, Dict] = {itm["ob_class"]: itm for itm in sheet_data}
 
                 ws = writer.book.create_sheet(sheet_name)
 
@@ -1932,6 +2013,14 @@ class ReportGenerator:
                     ws.cell(row=row_num, column=4, value=flag)
 
                 # ── Formula pass: Kronor and Netto cells ──
+                # Write pre-computed numeric values (so pandas / GUI can read them) and
+                # record the formula strings in sn_fc for later XML injection (so Excel
+                # still gets live, interactive formulas).
+
+                def _fw(rn_: int, col_: int, formula_: str, value_) -> None:
+                    """Write numeric cached value + remember formula for injection."""
+                    ws.cell(row=rn_, column=col_, value=value_ if value_ is not None else 0.0)
+                    sn_fc[(rn_, col_)] = formula_
 
                 # OB supplement rows: C=B*rate, E=D*rate, F=B-D, G=C-E
                 for ob in ReportGenerator.OB_SECTION_ORDER:
@@ -1939,19 +2028,21 @@ class ReportGenerator:
                         continue
                     rn = row_map[ob]
                     rate_cell = f"B{ob_rate_rows[ob]}"
-                    ws.cell(row=rn, column=3, value=f"=B{rn}*{rate_cell}")
-                    ws.cell(row=rn, column=5, value=f"=D{rn}*{rate_cell}")
-                    ws.cell(row=rn, column=6, value=f"=B{rn}-D{rn}")
-                    ws.cell(row=rn, column=7, value=f"=C{rn}-E{rn}")
+                    itm = item_map.get(ob, {})
+                    _fw(rn, 3, f"=B{rn}*{rate_cell}",  itm.get("sjk_kronor", 0.0))
+                    _fw(rn, 5, f"=D{rn}*{rate_cell}",  itm.get("justering_kronor", 0.0))
+                    _fw(rn, 6, f"=B{rn}-D{rn}",        itm.get("netto_timmar", 0.0))
+                    _fw(rn, 7, f"=C{rn}-E{rn}",        itm.get("netto_kronor", 0.0))
 
                 # _summary (Sjuklön timlön): C=B*timlon80, E=D*timlon80, F=B-D, G=C-E
                 if "_summary" in row_map:
                     rn = row_map["_summary"]
                     tl80 = f"B{META['timlon80']}"
-                    ws.cell(row=rn, column=3, value=f"=B{rn}*{tl80}")
-                    ws.cell(row=rn, column=5, value=f"=D{rn}*{tl80}")
-                    ws.cell(row=rn, column=6, value=f"=B{rn}-D{rn}")
-                    ws.cell(row=rn, column=7, value=f"=C{rn}-E{rn}")
+                    itm = item_map.get("_summary", {})
+                    _fw(rn, 3, f"=B{rn}*{tl80}", itm.get("sjk_kronor", 0.0))
+                    _fw(rn, 5, f"=D{rn}*{tl80}", itm.get("justering_kronor", 0.0))
+                    _fw(rn, 6, f"=B{rn}-D{rn}",  itm.get("netto_timmar", 0.0))
+                    _fw(rn, 7, f"=C{rn}-E{rn}",  itm.get("netto_kronor", 0.0))
 
                 # _sem_sjk: Kronor = _summary timmar * timlon100 * sempct  (no Timmar col)
                 if "_sem_sjk" in row_map and "_summary" in row_map:
@@ -1959,19 +2050,21 @@ class ReportGenerator:
                     sum_rn = row_map["_summary"]
                     tl100  = f"B{META['timlon100']}"
                     spct   = f"B{META['sempct']}"
-                    ws.cell(row=rn, column=3, value=f"=B{sum_rn}*{tl100}*{spct}")
-                    ws.cell(row=rn, column=5, value=f"=D{sum_rn}*{tl100}*{spct}")
-                    ws.cell(row=rn, column=7, value=f"=C{rn}-E{rn}")
+                    itm = item_map.get("_sem_sjk", {})
+                    _fw(rn, 3, f"=B{sum_rn}*{tl100}*{spct}", itm.get("sjk_kronor", 0.0))
+                    _fw(rn, 5, f"=D{sum_rn}*{tl100}*{spct}", itm.get("justering_kronor", 0.0))
+                    _fw(rn, 7, f"=C{rn}-E{rn}",              itm.get("netto_kronor", 0.0))
 
                 # _gt14: C=B*timlon100*sempct, E=D*timlon100*sempct, F=B-D, G=C-E
                 if "_gt14" in row_map:
                     rn    = row_map["_gt14"]
                     tl100 = f"B{META['timlon100']}"
                     spct  = f"B{META['sempct']}"
-                    ws.cell(row=rn, column=3, value=f"=B{rn}*{tl100}*{spct}")
-                    ws.cell(row=rn, column=5, value=f"=D{rn}*{tl100}*{spct}")
-                    ws.cell(row=rn, column=6, value=f"=B{rn}-D{rn}")
-                    ws.cell(row=rn, column=7, value=f"=C{rn}-E{rn}")
+                    itm = item_map.get("_gt14", {})
+                    _fw(rn, 3, f"=B{rn}*{tl100}*{spct}", itm.get("sjk_kronor", 0.0))
+                    _fw(rn, 5, f"=D{rn}*{tl100}*{spct}", itm.get("justering_kronor", 0.0))
+                    _fw(rn, 6, f"=B{rn}-D{rn}",          itm.get("netto_timmar", 0.0))
+                    _fw(rn, 7, f"=C{rn}-E{rn}",          itm.get("netto_kronor", 0.0))
 
                 # _sjk_exkl: sum of OB + _summary kronor
                 if "_sjk_exkl" in row_map:
@@ -1983,9 +2076,10 @@ class ReportGenerator:
                     c_refs = "+".join(f"C{r}" for r in sorted(salary_rows))
                     e_refs = "+".join(f"E{r}" for r in sorted(salary_rows))
                     g_refs = "+".join(f"G{r}" for r in sorted(salary_rows))
-                    ws.cell(row=rn, column=3, value=f"={c_refs}")
-                    ws.cell(row=rn, column=5, value=f"={e_refs}")
-                    ws.cell(row=rn, column=7, value=f"={g_refs}")
+                    itm = item_map.get("_sjk_exkl", {})
+                    _fw(rn, 3, f"={c_refs}", itm.get("sjk_kronor", 0.0))
+                    _fw(rn, 5, f"={e_refs}", itm.get("justering_kronor", 0.0))
+                    _fw(rn, 7, f"={g_refs}", itm.get("netto_kronor", 0.0))
 
                 # _sem_ers: _sem_sjk + _gt14
                 if "_sem_ers" in row_map:
@@ -1994,35 +2088,39 @@ class ReportGenerator:
                     c_refs = "+".join(f"C{r}" for r in sem_rows)
                     e_refs = "+".join(f"E{r}" for r in sem_rows)
                     g_refs = "+".join(f"G{r}" for r in sem_rows)
-                    ws.cell(row=rn, column=3, value=f"={c_refs}" if c_refs else "=0")
-                    ws.cell(row=rn, column=5, value=f"={e_refs}" if e_refs else "=0")
-                    ws.cell(row=rn, column=7, value=f"={g_refs}" if g_refs else "=0")
+                    itm = item_map.get("_sem_ers", {})
+                    _fw(rn, 3, f"={c_refs}" if c_refs else "=0", itm.get("sjk_kronor", 0.0))
+                    _fw(rn, 5, f"={e_refs}" if e_refs else "=0", itm.get("justering_kronor", 0.0))
+                    _fw(rn, 7, f"={g_refs}" if g_refs else "=0", itm.get("netto_kronor", 0.0))
 
                 # _sjuklon: _sjk_exkl + _sem_ers
                 if "_sjuklon" in row_map:
                     rn   = row_map["_sjuklon"]
                     exkl = row_map.get("_sjk_exkl")
                     sers = row_map.get("_sem_ers")
+                    itm = item_map.get("_sjuklon", {})
                     if exkl and sers:
-                        ws.cell(row=rn, column=3, value=f"=C{exkl}+C{sers}")
-                        ws.cell(row=rn, column=5, value=f"=E{exkl}+E{sers}")
-                        ws.cell(row=rn, column=7, value=f"=G{exkl}+G{sers}")
+                        _fw(rn, 3, f"=C{exkl}+C{sers}", itm.get("sjk_kronor", 0.0))
+                        _fw(rn, 5, f"=E{exkl}+E{sers}", itm.get("justering_kronor", 0.0))
+                        _fw(rn, 7, f"=G{exkl}+G{sers}", itm.get("netto_kronor", 0.0))
 
                 # _forsakring: Kronor = _sjuklon * forspct  (no Timmar col)
                 if "_forsakring" in row_map and "_sjuklon" in row_map:
                     rn  = row_map["_forsakring"]
                     sjl = row_map["_sjuklon"]
-                    ws.cell(row=rn, column=3, value=f"=C{sjl}*B{META['forspct']}")
-                    ws.cell(row=rn, column=5, value=f"=E{sjl}*B{META['forspct']}")
-                    ws.cell(row=rn, column=7, value=f"=G{sjl}*B{META['forspct']}")
+                    itm = item_map.get("_forsakring", {})
+                    _fw(rn, 3, f"=C{sjl}*B{META['forspct']}", itm.get("sjk_kronor", 0.0))
+                    _fw(rn, 5, f"=E{sjl}*B{META['forspct']}", itm.get("justering_kronor", 0.0))
+                    _fw(rn, 7, f"=G{sjl}*B{META['forspct']}", itm.get("netto_kronor", 0.0))
 
                 # _soc_avg: Kronor = _sjuklon * socpct  (no Timmar col)
                 if "_soc_avg" in row_map and "_sjuklon" in row_map:
                     rn  = row_map["_soc_avg"]
                     sjl = row_map["_sjuklon"]
-                    ws.cell(row=rn, column=3, value=f"=C{sjl}*B{META['socpct']}")
-                    ws.cell(row=rn, column=5, value=f"=E{sjl}*B{META['socpct']}")
-                    ws.cell(row=rn, column=7, value=f"=G{sjl}*B{META['socpct']}")
+                    itm = item_map.get("_soc_avg", {})
+                    _fw(rn, 3, f"=C{sjl}*B{META['socpct']}", itm.get("sjk_kronor", 0.0))
+                    _fw(rn, 5, f"=E{sjl}*B{META['socpct']}", itm.get("justering_kronor", 0.0))
+                    _fw(rn, 7, f"=G{sjl}*B{META['socpct']}", itm.get("netto_kronor", 0.0))
 
                 # _summa: _sjuklon + _forsakring + _soc_avg
                 if "_summa" in row_map:
@@ -2030,10 +2128,11 @@ class ReportGenerator:
                     sjl = row_map.get("_sjuklon")
                     frs = row_map.get("_forsakring")
                     soc = row_map.get("_soc_avg")
+                    itm = item_map.get("_summa", {})
                     if sjl and frs and soc:
-                        ws.cell(row=rn, column=3, value=f"=C{sjl}+C{frs}+C{soc}")
-                        ws.cell(row=rn, column=5, value=f"=E{sjl}+E{frs}+E{soc}")
-                        ws.cell(row=rn, column=7, value=f"=G{sjl}+G{frs}+G{soc}")
+                        _fw(rn, 3, f"=C{sjl}+C{frs}+C{soc}", itm.get("sjk_kronor", 0.0))
+                        _fw(rn, 5, f"=E{sjl}+E{frs}+E{soc}", itm.get("justering_kronor", 0.0))
+                        _fw(rn, 7, f"=G{sjl}+G{frs}+G{soc}", itm.get("netto_kronor", 0.0))
 
                 # Record the _summa netto cell reference for the summary sheet
                 summa_netto_ref = None
@@ -2071,6 +2170,8 @@ class ReportGenerator:
             ws_sum.column_dimensions["B"].width = 25
 
         logger.info(f"Excel report saved: {output_path} ({len(used_names)} employee sheets)")
+
+        _inject_formulas_into_xlsx(output_path, formula_cache)
 
 
 def process_karens_calculation(
