@@ -1753,6 +1753,11 @@ class ReportGenerator:
         # _inject_formulas_into_xlsx() later injects <v> cached values so pandas can read them.
         formula_cache: Dict[str, Dict[Tuple[int, int], float]] = {}
 
+        # Pre-computed employee DataFrames for the GUI (bypasses formula cell reads).
+        gui_sheets: Dict[str, pd.DataFrame] = {}
+        _GUI_COLS = ["OB-klass", "Sjk Timmar", "Sjk Kronor",
+                     "Just Timmar", "Just Kronor", "Netto Timmar", "Netto Kronor"]
+
         with pd.ExcelWriter(output_path, engine="openpyxl") as writer:
             # Sheet 1: Full detail
             detail.to_excel(writer, sheet_name="Detalj", index=False)
@@ -2035,6 +2040,35 @@ class ReportGenerator:
                     ws.cell(row=row_num, column=3, value=pdf_total)
                     ws.cell(row=row_num, column=4, value=flag)
 
+                # ── GUI DataFrame: pre-computed values (avoids reading formula cells) ──
+                _gui_rows = []
+                _section_items = (
+                    [it for it in sheet_data if not it["ob_class"].startswith("_")] +
+                    [it for it in sheet_data if it["ob_class"] in ReportGenerator.SUMMARY_SECTION_1] +
+                    [it for it in sheet_data if it["ob_class"] in ReportGenerator.SUMMARY_SECTION_2] +
+                    [it for it in sheet_data if it["ob_class"] in ReportGenerator.FEES_SECTION] +
+                    [it for it in sheet_data if it["ob_class"] in ReportGenerator.TOTAL_SECTION]
+                )
+                for _it in _section_items:
+                    _gui_rows.append([
+                        _it["display_name"],
+                        _it.get("sjk_timmar"),
+                        _it.get("sjk_kronor"),
+                        _it.get("justering_timmar"),
+                        _it.get("justering_kronor"),
+                        _it.get("netto_timmar"),
+                        _it.get("netto_kronor"),
+                    ])
+                if pdf_summa is not None and summa_row is not None:
+                    _gui_rows.append([
+                        "Kontroll mot Sjuklönekostnader",
+                        round(summa_row["sjk_kronor"]),
+                        round(pdf_summa),
+                        flag,
+                        None, None, None,
+                    ])
+                gui_sheets[sheet_name] = pd.DataFrame(_gui_rows, columns=_GUI_COLS)
+
                 # ── Formula pass: Kronor and Netto cells ──
                 # Write pre-computed numeric values (so pandas / GUI can read them) and
                 # record the formula strings in sn_fc for later XML injection (so Excel
@@ -2196,6 +2230,8 @@ class ReportGenerator:
 
         _inject_formulas_into_xlsx(output_path, formula_cache)
 
+        return gui_sheets
+
 
 def process_karens_calculation(
     sick_pdf: str,
@@ -2289,7 +2325,7 @@ def process_karens_calculation(
     rates = load_berakningsar_rates(berakningsar) if berakningsar else None
 
     # Save
-    ReportGenerator.save_excel(
+    gui_sheets = ReportGenerator.save_excel(
         detail, output_xlsx,
         sjk_total_hours=sjk_total_hours,
         sjk_karens_hours=sjk_karens_hours,
@@ -2300,6 +2336,7 @@ def process_karens_calculation(
         berakningsar=berakningsar,
         sjk_summa_by_pnr=sjk_summa_by_pnr,
     )
+    return gui_sheets
 
 
 if __name__ == "__main__":

@@ -44,7 +44,7 @@ def pdf_download(uploaded_file, label=None, key=None):
 def run_and_read_excel(
     sick_pdf_data: bytes, sick_pdf_name: str,
     payslip_files: list, sjk_pdf_data: bytes, sjk_pdf_name: str,
-    output_name: str, holidays, berakningsar_override: str = None,
+    output_name: str, holidays, storhelg=None, berakningsar_override: str = None,
 ):
     """Run calculation and read back Excel results. Returns a result dict."""
     with tempfile.TemporaryDirectory() as tmpdir:
@@ -68,16 +68,16 @@ def run_and_read_excel(
                 f.write(sjk_pdf_data)
 
         output_path = tmpdir_path / output_name
-        config = load_config(holidays=holidays)
+        config = load_config(holidays=holidays, storhelg=storhelg)
 
-        process_karens_calculation(
+        gui_sheets = process_karens_calculation(
             str(sick_pdf_path),
             payslip_paths,
             str(output_path),
             config,
             sjuklonekostnader_path=sjk_pdf_path,
             berakningsar_override=berakningsar_override or None,
-        )
+        ) or {}
 
         with open(output_path, "rb") as f:
             excel_data = f.read()
@@ -127,8 +127,12 @@ def run_and_read_excel(
                             except (ValueError, TypeError):
                                 pass
                         employee_metadata[sn] = meta
-                        # Data starts at row 24 (1-based) → skiprows=23
-                        tbl = pd.read_excel(xls, sheet_name=sn, header=None, skiprows=23)
+                        # Use pre-computed DataFrame from process_karens_calculation
+                        # (avoids reading formula cells that pandas returns as None).
+                        if sn in gui_sheets:
+                            tbl = gui_sheets[sn]
+                        else:
+                            tbl = pd.read_excel(xls, sheet_name=sn, header=None, skiprows=23)
                     else:
                         # Old format: metadata rows 1-11, group headers row 12,
                         # sub-headers row 14, data from row 15 (skiprows=13, drop first row)
@@ -382,6 +386,7 @@ def main():
                     sick_data, sick_pdf.name,
                     payslip_list, sjk_data, sjk_name,
                     output_name, st.session_state.holidays,
+                    storhelg=st.session_state.get("storhelg", []),
                     berakningsar_override=berakningsar_input.strip(),
                 )
 
@@ -463,6 +468,7 @@ def main():
                         res["payslip_files"],
                         res.get("sjk_pdf_data"), res.get("sjk_pdf_name"),
                         res["output_name"], st.session_state.holidays,
+                        storhelg=st.session_state.get("storhelg", []),
                         berakningsar_override=new_year.strip(),
                     )
                     recalc_result["sick_pdf_name"] = res["sick_pdf_name"]
