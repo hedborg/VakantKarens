@@ -1170,65 +1170,88 @@ class KarensCalculator:
         return "Sjuklön dag 1 - utanför karens"
 
 
-def _inject_formulas_into_xlsx(path: str, formula_map: Dict[str, Dict[Tuple[int, int], str]]) -> None:
-    """Post-process an xlsx file to inject <f>formula</f> elements into cells that already
-    carry pre-computed numeric <v> values.  This gives pandas/openpyxl (data_only=True) the
-    cached numeric value while still providing Excel with live formulas.
+def _inject_formulas_into_xlsx(path: str, value_map: Dict[str, Dict[Tuple[int, int], float]]) -> None:
+    """Post-process an xlsx file to inject <v>cachedValue</v> elements into formula cells.
 
-    path        – path to the saved xlsx file (modified in-place)
-    formula_map – {sheet_name: {(row_1based, col_1based): "=formula_string"}}
+    openpyxl writes formula strings as <f>formula</f> with no <v> element, so pandas
+    (data_only=True) returns None.  This function adds the pre-computed <v> so pandas
+    can read the number while Excel still shows the live formula.
+
+    path      – path to the saved xlsx file (modified in-place)
+    value_map – {sheet_name: {(row_1based, col_1based): numeric_value}}
     """
-    if not formula_map:
+    if not value_map:
         return
 
     import zipfile
     import io
     from openpyxl.utils import get_column_letter
 
-    # Convert (row, col) → cell-ref, strip leading '='
+    # Convert (row, col) → cell-ref
     sheet_ref_map: Dict[str, Dict[str, str]] = {}
-    for sname, cells in formula_map.items():
+    for sname, cells in value_map.items():
         refs: Dict[str, str] = {}
-        for (row, col), fml in cells.items():
-            refs[f"{get_column_letter(col)}{row}"] = fml.lstrip("=")
-        sheet_ref_map[sname] = refs
+        for (row, col), val in cells.items():
+            refs[f"{get_column_letter(col)}{row}"] = repr(float(val))
+        if refs:
+            sheet_ref_map[sname] = refs
+
+    if not sheet_ref_map:
+        return
 
     # Read the whole zip into memory
     with zipfile.ZipFile(path, "r") as zin:
         names = zin.namelist()
         raw: Dict[str, bytes] = {n: zin.read(n) for n in names}
 
-    # Resolve sheet name → internal XML path via workbook + rels
-    wb_text   = raw.get("xl/workbook.xml",             b"").decode("utf-8")
-    rels_text = raw.get("xl/_rels/workbook.xml.rels",  b"").decode("utf-8")
+    # Order-independent attribute extraction
+    def _attr(text: str, name: str) -> str:
+        m = re.search(r'\b' + re.escape(name) + r'="([^"]*)"', text)
+        return m.group(1) if m else ""
 
-    rid_to_file: Dict[str, str] = {}
-    for m in re.finditer(r'<Relationship\b[^>]*\bId="([^"]+)"[^>]*\bTarget="([^"]+)"', rels_text):
-        rid_to_file[m.group(1)] = m.group(2)
+    # Resolve sheet name → internal ZIP path
+    wb_text   = raw.get("xl/workbook.xml",            b"").decode("utf-8")
+    rels_text = raw.get("xl/_rels/workbook.xml.rels", b"").decode("utf-8")
 
-    name_to_path: Dict[str, str] = {}
-    for m in re.finditer(r'<sheet\b[^>]*\bname="([^"]+)"[^>]*\br:id="([^"]+)"', wb_text):
-        sname, rid = m.group(1), m.group(2)
-        target = rid_to_file.get(rid, "")
-        if target:
-            name_to_path[sname] = "xl/" + target if not target.startswith("xl/") else target
+    rid_to_target: Dict[str, str] = {}
+    for m in re.finditer(r'<Relationship\b[^/]*/>', rels_text):
+        el = m.group(0)
+        if "worksheet" not in _attr(el, "Type"):
+            continue
+        rid = _attr(el, "Id")
+        tgt = _attr(el, "Target")
+        if rid and tgt:
+            rid_to_target[rid] = tgt
+
+    name_to_zip: Dict[str, str] = {}
+    for m in re.finditer(r'<sheet\b[^/]*/>', wb_text):
+        el    = m.group(0)
+        sname = _attr(el, "name")
+        rid   = _attr(el, "r:id")
+        tgt   = rid_to_target.get(rid, "")
+        if sname and tgt:
+            name_to_zip[sname] = tgt if tgt.startswith("xl/") else f"xl/{tgt}"
 
     modified: Dict[str, bytes] = {}
-    for sname, refs in sheet_ref_map.items():
-        fpath = name_to_path.get(sname)
-        if not fpath or fpath not in raw:
+    for sname, ref_vals in sheet_ref_map.items():
+        zip_path = name_to_zip.get(sname)
+        if not zip_path or zip_path not in raw:
             continue
-        xml_text = raw[fpath].decode("utf-8")
-        for ref, formula in refs.items():
-            # Inject <f>formula</f> immediately after the cell's opening tag.
-            # The cell already has a <v> from the numeric write, so the result is:
-            #   <c r="C5" s="..."><f>B5*B15</f><v>123.45</v></c>
-            xml_text = re.sub(
-                r'(<c\s+r="' + re.escape(ref) + r'"[^>]*>)',
-                r'\1<f>' + formula + r'</f>',
-                xml_text,
+        xml = raw[zip_path].decode("utf-8")
+        for cell_ref, value in ref_vals.items():
+            # openpyxl writes: <c r="C5" s="4"><f>B5*B15</f></c>
+            # We inject <v> after </f> so pandas can read the cached value:
+            #   <c r="C5" s="4"><f>B5*B15</f><v>123.45</v></c>
+            xml = re.sub(
+                r'(<c\b[^>]*\br="' + re.escape(cell_ref) + r'"[^>]*>'
+                r'<f>[^<]*</f>)',
+                lambda mo, v=value: mo.group(0) + f'<v>{v}</v>',
+                xml,
             )
-        modified[fpath] = xml_text.encode("utf-8")
+        modified[zip_path] = xml.encode("utf-8")
+
+    if not modified:
+        return
 
     # Re-pack zip with modified sheets
     buf = io.BytesIO()
@@ -1725,10 +1748,10 @@ class ReportGenerator:
         period = parts[1] if len(parts) >= 2 else ""
         year = berakningsar or (period[:4] if len(period) >= 4 else "")
 
-        # Collect formula strings keyed by (sheet_name, row, col) for post-processing.
-        # We write numeric cached values to the cells; _inject_formulas_into_xlsx() later
-        # injects the <f> elements so Excel still gets live, interactive formulas.
-        formula_cache: Dict[str, Dict[Tuple[int, int], str]] = {}
+        # Collect pre-computed numeric values for formula cells.
+        # We write formula strings to the cells (so Excel gets live formulas);
+        # _inject_formulas_into_xlsx() later injects <v> cached values so pandas can read them.
+        formula_cache: Dict[str, Dict[Tuple[int, int], float]] = {}
 
         with pd.ExcelWriter(output_path, engine="openpyxl") as writer:
             # Sheet 1: Full detail
@@ -1807,8 +1830,8 @@ class ReportGenerator:
                     counter += 1
                 used_names.add(sheet_name)
 
-                # Per-sheet formula cache: {(row, col): "=formula_string"}
-                sn_fc: Dict[Tuple[int, int], str] = {}
+                # Per-sheet value cache: {(row, col): numeric_value} for post-processing
+                sn_fc: Dict[Tuple[int, int], float] = {}
                 formula_cache[sheet_name] = sn_fc
                 # Quick lookup for pre-computed numeric values
                 item_map: Dict[str, Dict] = {itm["ob_class"]: itm for itm in sheet_data}
@@ -2018,9 +2041,9 @@ class ReportGenerator:
                 # still gets live, interactive formulas).
 
                 def _fw(rn_: int, col_: int, formula_: str, value_) -> None:
-                    """Write numeric cached value + remember formula for injection."""
-                    ws.cell(row=rn_, column=col_, value=value_ if value_ is not None else 0.0)
-                    sn_fc[(rn_, col_)] = formula_
+                    """Write formula string (for Excel) + store numeric value for <v> injection."""
+                    ws.cell(row=rn_, column=col_, value=formula_)
+                    sn_fc[(rn_, col_)] = float(value_) if value_ is not None else 0.0
 
                 # OB supplement rows: C=B*rate, E=D*rate, F=B-D, G=C-E
                 for ob in ReportGenerator.OB_SECTION_ORDER:
