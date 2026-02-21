@@ -1214,7 +1214,7 @@ def _inject_formulas_into_xlsx(path: str, value_map: Dict[str, Dict[Tuple[int, i
     rels_text = raw.get("xl/_rels/workbook.xml.rels", b"").decode("utf-8")
 
     rid_to_target: Dict[str, str] = {}
-    for m in re.finditer(r'<Relationship\b[^/]*/>', rels_text):
+    for m in re.finditer(r'<Relationship\b[^>]*/>', rels_text):
         el = m.group(0)
         if "worksheet" not in _attr(el, "Type"):
             continue
@@ -1224,7 +1224,7 @@ def _inject_formulas_into_xlsx(path: str, value_map: Dict[str, Dict[Tuple[int, i
             rid_to_target[rid] = tgt
 
     name_to_zip: Dict[str, str] = {}
-    for m in re.finditer(r'<sheet\b[^/]*/>', wb_text):
+    for m in re.finditer(r'<sheet\b[^>]*/>', wb_text):
         el    = m.group(0)
         sname = _attr(el, "name")
         rid   = _attr(el, "r:id")
