@@ -451,60 +451,165 @@ class SickListParser:
     # Pattern matching hours like "1,50" or "5,00"
     _HOURS_RE = re.compile(r"^\d+,\d+$")
 
+    # Matches hours values like "8,00" or "14,50" (1-2 digits, comma, 2 digits)
+    _JOUR_HOURS_RE = re.compile(r"^\d{1,2},\d{2}$")
+    # Matches a day number only (1 or 2 digits, 1-31)
+    _DAY_WORD_RE = re.compile(r"^\d{1,2}$")
+
     def _extract_jour_set(self, page) -> set:
         """
-        Use table extraction on a sick list page to detect jour rows.
+        Detect jour rows on a sick list page and return a set of
+        (day: int, start: str, end: str) tuples.
 
-        The PDF table has separate columns for regular hours and jour
-        hours on the left (Sjukskriven) side.  Jour rows are identified
-        by: col 0 has only a day number (no time), followed by empty
-        cells, then a time pair and hours further right.
+        Two detection strategies are tried in order:
 
-        The column layout varies between pages (17 vs 21 cols), so
-        detection is position-agnostic: we scan left-side columns for
-        the structural jour pattern.
+        1. Table extraction (original approach) — works when pdfplumber
+           can reconstruct the PDF table structure.  Jour rows are
+           identified by an empty gap in cols 1-2 followed by times
+           further right.
+
+        2. Word-position analysis (fallback) — used when table extraction
+           returns no tables (e.g. the aggregate Sjuklista pages that use
+           positional text layout rather than PDF table objects).
+
+           The page header contains two column labels that serve as
+           x-coordinate anchors:
+             "Jour"  — the left edge of the "Jour Timmar" column on the
+                       sjukskriven (left) side.  Any hours value whose
+                       x0 exceeds this threshold is a jour hour.
+             "Tid"   — appears twice: once for the sjukskriven side and
+                       once for the vikarie (right) side.  The second
+                       occurrence marks where the vikarie side begins;
+                       everything at or beyond that x is excluded so we
+                       never count vikarie hours as sjukskriven.
+
+           Within the sjukskriven side, rows are grouped by y-position
+           (±5 px tolerance — the day-number word sits ~0.45 px above
+           the rest of its row, so ±2 px is too tight).  A row is a
+           jour row when its hours word x0 > jour_threshold.
 
         Returns a set of (day: int, start: str, end: str) tuples that
         are jour rows, used to override the text-based detection which
         cannot distinguish jour from regular on summary pages.
         """
         jour_keys: set = set()
+
+        # ── Strategy 1: table extraction ──────────────────────────────
         try:
             tables = page.extract_tables(
                 {"vertical_strategy": "text", "horizontal_strategy": "text"}
             )
-            if not tables:
-                return jour_keys
+            if tables:
+                for row in tables[0]:
+                    if len(row) < 8:
+                        continue
 
-            for row in tables[0]:
-                if len(row) < 8:
-                    continue
+                    # Col 0 must have only a day number (no time merged in)
+                    cell0 = (row[0] or "").strip()
+                    day_m = re.match(r"^(\d{1,2})$", cell0)
+                    if not day_m:
+                        continue
+                    day = int(day_m.group(1))
 
-                # Col 0 must have only a day number (no time merged in)
-                cell0 = (row[0] or "").strip()
-                day_m = re.match(r"^(\d{1,2})$", cell0)
-                if not day_m:
-                    continue
-                day = int(day_m.group(1))
+                    # Cols 1-2 must be empty (regular rows have "-" and end time)
+                    if (row[1] and row[1].strip()) or (row[2] and row[2].strip()):
+                        continue
 
-                # Cols 1-2 must be empty (regular rows have "-" and end time)
-                if (row[1] and row[1].strip()) or (row[2] and row[2].strip()):
-                    continue
+                    # Scan remaining left-side cols for times and hours.
+                    # Look in the first ~10 columns (left/Sjukskriven side).
+                    scan_limit = min(len(row), 10)
+                    times = []
+                    for ci in range(3, scan_limit):
+                        cell = (row[ci] or "").strip()
+                        for tm in self._TIME_RE.finditer(cell):
+                            times.append(tm.group(1))
 
-                # Scan remaining left-side cols for times and hours.
-                # Look in the first ~10 columns (left/Sjukskriven side).
-                scan_limit = min(len(row), 10)
-                times = []
-                for ci in range(3, scan_limit):
-                    cell = (row[ci] or "").strip()
-                    for tm in self._TIME_RE.finditer(cell):
-                        times.append(tm.group(1))
+                    if len(times) >= 2:
+                        jour_keys.add((day, times[0], times[1]))
 
-                if len(times) >= 2:
-                    jour_keys.add((day, times[0], times[1]))
+                logger.debug(f"Table strategy found {len(jour_keys)} jour rows")
+                if jour_keys:
+                    return jour_keys
+                # Table was found but yielded 0 jour rows — the table may
+                # belong to a different PDF format (e.g. the aggregate sick
+                # list pages that use positional layout).  Fall through to
+                # the word-position strategy so we don't miss jour rows.
 
         except Exception as e:
             logger.debug(f"Table extraction for jour detection failed: {e}")
+
+        # ── Strategy 2: word-position analysis ────────────────────────
+        try:
+            words = page.extract_words()
+
+            # Locate column boundaries from the header row.
+            # "Jour" (first occurrence) = left edge of "Jour Timmar" column
+            #   → hours with x0 > jour_threshold are jour hours.
+            # "Tid"  (second occurrence) = start of the vikarie side
+            #   → everything at x0 >= vikarie_start is excluded.
+            jour_threshold = None
+            vikarie_start  = None
+            tid_seen = 0
+            for w in words:
+                if w["text"] == "Jour" and jour_threshold is None:
+                    jour_threshold = w["x0"]
+                if w["text"] == "Tid":
+                    tid_seen += 1
+                    if tid_seen == 2:
+                        vikarie_start = w["x0"]
+                if jour_threshold is not None and vikarie_start is not None:
+                    break
+
+            if jour_threshold is None or vikarie_start is None:
+                logger.debug("Word-position jour detection: header labels not found")
+                return jour_keys
+
+            logger.debug(
+                f"Word-position jour detection: jour_threshold={jour_threshold:.1f}, "
+                f"vikarie_start={vikarie_start:.1f}"
+            )
+
+            # Group words into logical rows using a ±5 px y-tolerance.
+            # (The day-number word sits ~0.45 px above the rest of its row,
+            # so a ±2 px bucket is too tight and splits them apart.)
+            rows: dict = {}
+            for w in words:
+                bucket = round(w["top"] / 5) * 5
+                rows.setdefault(bucket, []).append(w)
+
+            for _y, row_words in sorted(rows.items()):
+                # Restrict to sjukskriven (left) side only
+                left = [w for w in row_words if w["x0"] < vikarie_start]
+
+                # Row must have a valid day number at the far left (x0 < 80)
+                day_word = next(
+                    (w for w in left
+                     if self._DAY_WORD_RE.match(w["text"]) and w["x0"] < 80),
+                    None,
+                )
+                if day_word is None:
+                    continue
+                day = int(day_word["text"])
+                if not (1 <= day <= 31):
+                    continue
+
+                # Find time words and the hours value on the left side
+                times = [w for w in left if self._TIME_RE.fullmatch(w["text"])]
+                hours_words = [
+                    w for w in left if self._JOUR_HOURS_RE.match(w["text"])
+                ]
+
+                if len(times) < 2 or not hours_words:
+                    continue
+
+                h = hours_words[0]
+                if h["x0"] > jour_threshold:
+                    jour_keys.add((day, times[0]["text"], times[1]["text"]))
+
+            logger.debug(f"Word-position strategy found {len(jour_keys)} jour rows")
+
+        except Exception as e:
+            logger.debug(f"Word-position jour detection failed: {e}")
 
         return jour_keys
 
