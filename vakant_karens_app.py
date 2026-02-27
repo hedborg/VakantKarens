@@ -205,6 +205,9 @@ class OBClassifier:
     def __init__(self, holidays: set[date], storhelg: Optional[set[date]] = None):
         self.holidays = holidays        # Regular holidays → Helg OB
         self.storhelg = storhelg or set()  # Storhelg holidays → Storhelg OB
+        # §10 B holidays: eve starts at 16:00 (trettondag jul, 1 maj, Kristi himmelsfärd,
+        # nationaldagen, alla helgons dag) — i.e. regular holidays not in storhelg
+        self.helg_eve_16 = self.holidays - self.storhelg
 
     def classify(self, dt: datetime) -> str:
         """
@@ -212,10 +215,11 @@ class OBClassifier:
 
         Categories:
         - Storhelg: Storhelg dates (Påsk, Midsommar, Jul, Nyår) 00:00-24:00,
-                    day-before-storhelg 19:00-24:00, day-after-storhelg 00:00-07:00
+                    day-before-storhelg 18:00-24:00, day-after-storhelg 00:00-07:00
         - Helg: Saturday/Sunday 00:00-24:00, regular holidays 00:00-24:00,
                 Friday 19:00-24:00, Monday 00:00-07:00,
-                day-before-regular-holiday 19:00-24:00,
+                day-before-§10B-holiday 16:00-24:00 (trettondag jul, 1 maj,
+                  Kristi himmelsfärd, nationaldagen, alla helgons dag),
                 day-after-regular-holiday 00:00-07:00
         - Natt: Weekday 22:00-06:00
         - Kväll: Weekday 19:00-22:00
@@ -236,13 +240,16 @@ class OBClassifier:
         if d.weekday() >= 5:
             return "Helg"
 
-        # Evening/night transitions (19:00+) into next day
-        if t >= time(19, 0):
-            next_day = d + timedelta(days=1)
-            if next_day in self.storhelg:
-                return "Storhelg"
-            if next_day in self.holidays or d.weekday() == 4:  # Friday or day-before-holiday
-                return "Helg"
+        # Evening/night transitions into next day
+        next_day = d + timedelta(days=1)
+        if t >= time(18, 0) and next_day in self.storhelg:
+            return "Storhelg"
+        # §10 B: eve of specific holidays starts at 16:00
+        if t >= time(16, 0) and next_day in self.helg_eve_16:
+            return "Helg"
+        # Friday eve (→ Saturday) and generic holiday eve start at 19:00
+        if t >= time(19, 0) and d.weekday() == 4:  # Friday
+            return "Helg"
 
         # Morning transitions (00:00-07:00) trailing from previous day
         if t < time(7, 0):
@@ -256,7 +263,7 @@ class OBClassifier:
         if t >= time(22, 0) or t < time(6, 0):
             return "Natt"
 
-        # Evening (19:00-22:00) — already handled Friday/day-before-holiday above
+        # Evening (19:00-22:00) — Friday/day-before-holiday already handled above
         if t >= time(19, 0):
             return "Kväll"
 
@@ -1158,7 +1165,8 @@ class KarensCalculator:
         - Mon 00:00-06:00 (trailing Sunday) → helg
         - Day-after-holiday 00:00-06:00 → helg
         - Fri 19:00-24:00 (leading into Saturday) → helg
-        - Day-before-holiday 19:00-24:00 → helg
+        - Day-before-§10B-holiday 16:00-24:00 → helg
+        - Day-before-storhelg 18:00-24:00 → helg (via storhelg check)
         """
         d = dt.date()
         t = dt.time()
@@ -1168,10 +1176,15 @@ class KarensCalculator:
         if d.weekday() >= 5:
             return True
         # Evening before helg day
-        if t >= time(19, 0):
-            nxt = d + timedelta(days=1)
-            if nxt in self.config.storhelg or nxt in self.config.holidays or d.weekday() == 4:
-                return True
+        nxt = d + timedelta(days=1)
+        if t >= time(18, 0) and nxt in self.config.storhelg:
+            return True
+        # §10 B: eve of specific holidays starts at 16:00
+        if t >= time(16, 0) and nxt in self.ob_classifier.helg_eve_16:
+            return True
+        # Friday eve (→ Saturday) starts at 19:00
+        if t >= time(19, 0) and d.weekday() == 4:
+            return True
         # Morning after helg day (06:00 boundary for jour)
         if t < time(6, 0):
             prev = d - timedelta(days=1)
