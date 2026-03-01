@@ -76,6 +76,8 @@ storhelg:
 - '2025-12-24'   # Julafton
 - '2025-12-25'   # Juldag
 - '2025-12-26'   # Annandag jul
+- '2025-12-27'   # Lördag efter jul
+- '2025-12-28'   # Söndag efter jul
 - '2025-12-31'   # Nyårsafton
 # 2026
 - '2026-01-01'   # Nyårsdag
