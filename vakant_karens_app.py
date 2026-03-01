@@ -576,12 +576,15 @@ class SickListParser:
                 f"vikarie_start={vikarie_start:.1f}"
             )
 
-            # Group words into logical rows using a ±5 px y-tolerance.
-            # (The day-number word sits ~0.45 px above the rest of its row,
-            # so a ±2 px bucket is too tight and splits them apart.)
+            # Group words into logical rows using a ±10 px y-tolerance.
+            # (The day-number word can sit a few px above/below the rest of its
+            # row.  A 5 px bucket is too tight — a 0.4 px offset that straddles
+            # a bucket boundary (e.g. top=122.2 → 120 vs top=122.6 → 125) splits
+            # the day number from the times.  10 px is safe because rows are
+            # ~14 px apart, so adjacent rows always land in different buckets.)
             rows: dict = {}
             for w in words:
-                bucket = round(w["top"] / 5) * 5
+                bucket = round(w["top"] / 10) * 10
                 rows.setdefault(bucket, []).append(w)
 
             for _y, row_words in sorted(rows.items()):
@@ -656,21 +659,59 @@ class SickListParser:
         sick_hrs = PersonnummerParser.parse_float_sv(m0.group(4))
         rest = m0.group(5)
 
-        # Extract personnummer or anställningsnr from Sjukskriven side
-        # Try full personnummer first (10-12 digits), then short anställningsnr (3+ digits)
-        mp = re.search(r"(\d{10,12})", rest)
-        if not mp:
-            mp = re.search(r"(\d{3,9})", rest)
-            if not mp:
-                return None
+        # Extract personnummer or anställningsnr from Sjukskriven side.
+        # Three strategies, in order:
+        #
+        # 1. Clean run of 10-12 consecutive digits (normal, no interleaving).
+        #
+        # 2. Column-overlap recovery: when the PDF renderer interleaves the name
+        #    characters with the personnummer digits (e.g. "Abdulha1m9i9d112237178")
+        #    no single digit run reaches 10 digits.  But since names NEVER contain
+        #    digits and personnummer NEVER contains letters, all digits in the prefix
+        #    (everything before the first "HH:MM" which marks the vikarie's time)
+        #    must belong to the personnummer.  Collect them and reassemble.
+        #
+        # 3. Short anställningsnr (3–9 digits).
+        #
+        # In every case the name is cleaned by stripping stray interleaved digits.
 
-        raw_id = mp.group(1)
-        sick_pnr = PersonnummerParser.normalize(raw_id) if len(raw_id) >= 10 else raw_id
-        sick_name = rest[:mp.start()].strip()
+        # Delimit the sjukskriven prefix at the first vikarie time "HH:MM"
+        time_m = re.search(r"\d{2}:\d{2}", rest)
+        prefix = rest[:time_m.start()] if time_m else rest
+        tail_start = time_m.start() if time_m else len(rest)
+
+        # All ID searches are scoped to the prefix so we never accidentally
+        # pick up the vikarie's personnummer from the right side of the row.
+        mp = re.search(r"(\d{10,12})", prefix)
+        if mp:
+            # Strategy 1: clean digit run found in the sjukskriven prefix
+            raw_id = mp.group(1)
+            sick_pnr = PersonnummerParser.normalize(raw_id) if len(raw_id) >= 10 else raw_id
+            name_src = prefix[:mp.start()]
+            tail = rest[tail_start:].strip()
+        else:
+            digits_only = re.sub(r"\D", "", prefix)
+            if 10 <= len(digits_only) <= 12:
+                # Strategy 2: reassemble personnummer from interleaved digits
+                raw_id = digits_only
+                sick_pnr = PersonnummerParser.normalize(raw_id) if len(raw_id) >= 10 else raw_id
+                name_src = prefix
+                tail = rest[tail_start:].strip()
+            else:
+                # Strategy 3: short anställningsnr (also scoped to prefix)
+                mp = re.search(r"(\d{3,9})", prefix)
+                if not mp:
+                    return None
+                raw_id = mp.group(1)
+                sick_pnr = raw_id
+                name_src = prefix[:mp.start()]
+                tail = rest[tail_start:].strip()
+
+        # Names never contain digits — strip any stray interleaved digit characters
+        sick_name = re.sub(r"\d", "", name_src)
         sick_name = re.sub(r"\s{2,}", " ", sick_name).strip()
 
         # Check if replacement is vacant
-        tail = rest[mp.end():].strip()
         m1 = re.search(r"(\d{2}:\d{2})\s*-\s*(\d{2}:\d{2})\s+(\d+,\d+)\s+(.*)$", tail)
         repl_is_vacant = False
         if m1:
@@ -2408,8 +2449,21 @@ def process_karens_calculation(
     anst_to_pnr = {str(v): k for k, v in anst_map.items()}
     def resolve_pnr(val):
         val = str(val)
-        if len(val) >= 10:
+        if len(val) == 12:
             return val
+        if len(val) == 10:
+            return PersonnummerParser.normalize(val)
+        if len(val) == 11:
+            # PDF column overlap can strip the leading century digit from a 12-digit pnr
+            # (e.g. "1" + "ss" from name suffix + "98911050113" → regex picks up "98911050113")
+            # Try prepending the century digit and check against known pnr keys
+            for prefix in ("1", "2"):
+                candidate = prefix + val
+                if candidate in anst_map:
+                    return candidate
+            # Fallback: treat last 10 digits as 10-digit pnr and normalize
+            return PersonnummerParser.normalize(val[1:])
+        # Short anställningsnr (3-9 digits): look up in reverse map
         return anst_to_pnr.get(val, val)
     sick_df["Personnummer"] = sick_df["Personnummer"].apply(resolve_pnr)
 
