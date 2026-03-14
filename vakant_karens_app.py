@@ -1727,11 +1727,14 @@ class ReportGenerator:
         # justering = karens + >14 vacancy hours from detail
         # netto = max(0, sjk - justering)
         karens_sjk = round(karens_hours, 2)
+        _JOUR_OB = {"Sjuk jourers helg", "Sjuk jourers vardag"}
         gt14_karens_just = round(
             min(
                 karens_sjk,
                 emp_detail.loc[
-                    emp_detail["Status"].isin({"Karens", "Karens och >14"}), "Timmar"
+                    emp_detail["Status"].isin({"Karens", "Karens och >14"})
+                    & ~emp_detail["OB-klass"].isin(_JOUR_OB),
+                    "Timmar",
                 ].sum(),
             ),
             2,
