@@ -303,6 +303,24 @@ def main():
                 else:
                     payslip_pdfs.append(pdf)
 
+        # Beräkningsår + Beräkna button — shown above classification
+        available_years = load_berakningsar_years()
+        year_options = ["(automatiskt)"] + available_years
+        yr_col, btn_col = st.columns([1, 2])
+        with yr_col:
+            berakningsar_choice = st.selectbox(
+                "Beräkningsår",
+                options=year_options,
+                index=0,
+                help="Välj '(automatiskt)' för att använda perioden från sjuklistan, eller välj ett specifikt år.",
+                key="berakningsar_input",
+                label_visibility="collapsed",
+            )
+        berakningsar_input = "" if berakningsar_choice == "(automatiskt)" else berakningsar_choice
+        with btn_col:
+            do_calculate = st.button("Beräkna Karens & OB", type="primary", use_container_width=True)
+
+        if uploaded_pdfs:
             # Show classification results
             st.markdown("**Automatisk klassificering:**")
             col1, col2, col3 = st.columns(3)
@@ -331,7 +349,6 @@ def main():
                     st.info("📋 Sjuklönekostnader: ej uppladdad (valfritt)")
 
         # Output filename - derive from Sjuklista name
-        st.divider()
         default_output = "Vakansrapport.xlsx"
         if sick_pdf:
             # Sjuklista_3061_202505.pdf => Vakansrapport_3061_202505.xlsx
@@ -346,22 +363,7 @@ def main():
             help="Namnet på Excel-filen som ska genereras"
         )
 
-        # Beräkningsår override
-        available_years = load_berakningsar_years()
-        year_options = ["(automatiskt)"] + available_years
-        berakningsar_choice = st.selectbox(
-            "Beräkningsår",
-            options=year_options,
-            index=0,
-            help="Välj '(automatiskt)' för att använda perioden från sjuklistan, eller välj ett specifikt år.",
-            key="berakningsar_input",
-        )
-        berakningsar_input = "" if berakningsar_choice == "(automatiskt)" else berakningsar_choice
-
-        # Process button
-        st.divider()
-
-        if st.button("Beräkna Karens & OB", type="primary", use_container_width=True):
+        if do_calculate:
             if not sick_pdf:
                 st.error("Ingen sjuklista hittad! Filnamnet måste börja med 'Sjuklista'.")
                 return
@@ -418,29 +420,8 @@ def main():
 
         st.success("Beräkning genomförd!")
 
-        # Action buttons at top for quick access
-        btn_col1, btn_col2 = st.columns(2)
-
-        with btn_col1:
-            st.download_button(
-                label="💾 Ladda ner Excel-rapport",
-                data=res["excel_data"],
-                file_name=res["output_name"],
-                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                use_container_width=True,
-                key="dl_top",
-            )
-
-        with btn_col2:
-            if st.button("🗑️ Rensa och ladda upp nya dokument", use_container_width=True, key="reset_top"):
-                st.session_state.result = None
-                if "all_pdfs" in st.session_state:
-                    del st.session_state["all_pdfs"]
-                st.rerun()
-
-        # Show current beräkningsår and recalculate option
+        # Determine current beräkningsår for the dropdown default
         current_year = res.get("berakningsar_used", "")
-        # Try to get the actual year used from employee metadata
         if not current_year:
             for meta in employee_metadata.values():
                 yr = meta.get("berakningsar", "")
@@ -448,20 +429,24 @@ def main():
                     current_year = str(int(yr)) if isinstance(yr, (int, float)) and yr == int(yr) else str(yr)
                     break
 
-        with st.expander(f"Beräkningsår: {current_year or '(okänt)'} — Ändra?", expanded=False):
-            recalc_years = load_berakningsar_years()
-            try:
-                recalc_default = recalc_years.index(current_year)
-            except (ValueError, IndexError):
-                recalc_default = 0
+        # Action strip: [År ▼ | Beräkna om | 💾 Ladda ner | 🗑️ Rensa]
+        recalc_years = load_berakningsar_years()
+        try:
+            recalc_default = recalc_years.index(current_year)
+        except (ValueError, IndexError):
+            recalc_default = 0
+
+        ac1, ac2, ac3, ac4 = st.columns([1, 1, 1, 1])
+        with ac1:
             new_year = st.selectbox(
-                "Nytt beräkningsår",
+                "Beräkningsår",
                 options=recalc_years,
                 index=recalc_default,
                 key="recalc_year",
-                help="Välj beräkningsår och klicka Beräkna om",
+                label_visibility="collapsed",
             )
-            if st.button("Beräkna om", type="primary", key="recalc_btn"):
+        with ac2:
+            if st.button("🔄 Beräkna om", type="primary", use_container_width=True, key="recalc_btn"):
                 try:
                     recalc_result = run_and_read_excel(
                         res["sick_pdf_data"], res["sick_pdf_name"],
@@ -481,6 +466,21 @@ def main():
                     st.rerun()
                 except Exception as e:
                     st.error(f"Fel vid omberäkning: {str(e)}")
+        with ac3:
+            st.download_button(
+                label="💾 Ladda ner",
+                data=res["excel_data"],
+                file_name=res["output_name"],
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                use_container_width=True,
+                key="dl_top",
+            )
+        with ac4:
+            if st.button("🗑️ Rensa", use_container_width=True, key="reset_top"):
+                st.session_state.result = None
+                if "all_pdfs" in st.session_state:
+                    del st.session_state["all_pdfs"]
+                st.rerun()
 
         # Show uploaded files with download buttons
         with st.expander("📁 Uppladdade filer", expanded=False):
